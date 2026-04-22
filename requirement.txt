@@ -1,0 +1,8 @@
+pydantic
+pyyaml
+openai
+pytest
+tiktoken
+markdown-it-py
+tenacity
+python-dotenv
