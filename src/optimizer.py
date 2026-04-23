@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from .chunker import chunk_markdown_body, count_tokens
 from .llm_client import BlockClassificationResult, SkillLLMClient
-from .models import ContentBlock, ContentType, Skill, References, OnDemandModules
+from .models import ContentBlock, ContentType, Skill, References, OnDemandModules, RoutingMetadata
 
 
 def _is_content_type(block: ContentBlock, content_type: ContentType) -> bool:
@@ -631,6 +631,122 @@ Keep only unique, additional information."""
 
         return new_references, total_deduped, files_discarded
 
+    def generate_routing_metadata(
+        self,
+        module_type: str,
+        module_content: str,
+        skill_name: str,
+        skill_description: str
+    ) -> RoutingMetadata:
+        """
+        Generate routing metadata for an on-demand module.
+
+        Per SkillReducer paper, each reference file should have:
+        - when: Trigger condition description
+        - topics: 3-5 topic keywords
+
+        Args:
+            module_type: Type of module (examples/templates/background).
+            module_content: Content of the module.
+            skill_name: Name of the parent skill.
+            skill_description: Description of the parent skill.
+
+        Returns:
+            RoutingMetadata with when and topics.
+        """
+        type_descriptions = {
+            "examples": "code examples and usage demonstrations",
+            "templates": "ready-to-use templates and boilerplate text",
+            "background": "explanations and contextual knowledge"
+        }
+
+        system_prompt = """You are an expert at creating routing metadata for reference files.
+
+Your task is to generate routing metadata that helps determine when to load this on-demand module.
+
+The metadata should include:
+1. "when": A natural language description of when this module should be loaded
+   - Focus on user intent and questions this module can answer
+   - Be specific enough to avoid false positives
+   - Use patterns like "when user asks about X" or "when user needs Y"
+
+2. "topics": 3-5 keywords that describe the main topics covered
+   - These keywords are used for semantic matching
+   - Be specific and use domain terminology where appropriate
+
+IMPORTANT: Respond with a JSON object:
+{
+  "when": "Load this when user asks about X, Y, or Z",
+  "topics": ["topic1", "topic2", "topic3", "topic4", "topic5"]
+}"""
+
+        user_prompt = f"""Skill: {skill_name}
+Description: {skill_description}
+
+Module Type: {module_type} ({type_descriptions.get(module_type, "reference content")})
+
+Module Content:
+{module_content[:2000]}
+
+Generate routing metadata for this on-demand module."""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+
+        response_text = response.choices[0].message.content
+        result = json.loads(response_text)
+
+        return RoutingMetadata(
+            when=result.get("when", f"Load when user needs {module_type}"),
+            topics=result.get("topics", [module_type])
+        )
+
+    def generate_all_routing_metadata(
+        self,
+        on_demand_modules: OnDemandModules,
+        skill_name: str,
+        skill_description: str
+    ) -> dict[str, RoutingMetadata]:
+        """
+        Generate routing metadata for all on-demand modules.
+
+        Args:
+            on_demand_modules: The on-demand modules to generate metadata for.
+            skill_name: Name of the parent skill.
+            skill_description: Description of the parent skill.
+
+        Returns:
+            Dictionary mapping filename to RoutingMetadata.
+        """
+        metadata = {}
+
+        if on_demand_modules.examples:
+            content = "\n".join([b.content for b in on_demand_modules.examples])
+            metadata["on-demand-examples.md"] = self.generate_routing_metadata(
+                "examples", content, skill_name, skill_description
+            )
+
+        if on_demand_modules.templates:
+            content = "\n".join([b.content for b in on_demand_modules.templates])
+            metadata["on-demand-templates.md"] = self.generate_routing_metadata(
+                "templates", content, skill_name, skill_description
+            )
+
+        if on_demand_modules.background:
+            content = "\n".join([b.content for b in on_demand_modules.background])
+            metadata["on-demand-background.md"] = self.generate_routing_metadata(
+                "background", content, skill_name, skill_description
+            )
+
+        return metadata
+
     # ============================================================
     # Full Pipeline
     # ============================================================
@@ -740,8 +856,15 @@ Keep only unique, additional information."""
                 core_blocks, skill.references  # Only core blocks for dedup
             )
 
-        # Add on-demand modules to references
-        on_demand_files = on_demand_modules.to_reference_files()
+        # Step 7: Generate routing metadata for on-demand modules
+        routing_metadata = self.generate_all_routing_metadata(
+            on_demand_modules=on_demand_modules,
+            skill_name=skill.name,
+            skill_description=skill.description.original
+        )
+
+        # Add on-demand modules to references with routing metadata
+        on_demand_files = on_demand_modules.to_reference_files(routing_metadata)
         all_reference_files = {**updated_references.files, **on_demand_files}
 
         # Calculate final metrics

@@ -3,17 +3,28 @@ Stage 1 Router Optimizer for skill description compression.
 
 Implements the delta debugging approach from the SkillReducer paper for
 optimizing the routing layer (skill descriptions).
+
+Key improvements aligned with paper:
+- Phase 1: DDMIN for minimal clause subset
+- Phase 2: Real-world validation with selective restore
+- TF-IDF based real distractors + 1 LLM-generated adversarial skill
+- Pre-generation for missing/short descriptions
 """
 
 import json
+import os
+import math
 from typing import Optional
 from dataclasses import dataclass
+from collections import Counter
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .models import Skill
 from .llm_client import SkillLLMClient
+from .chunker import count_tokens
 
 
 class SemanticClause(BaseModel):
@@ -53,6 +64,152 @@ class CompressionResult:
     compressed_token_count: int
     clauses_removed: int
     compression_ratio: float
+    phase1_passed: bool = True
+    phase2_passed: bool = True
+    restored_clauses: list[str] = None
+
+
+class SkillLibraryTFIDF:
+    """
+    TF-IDF index for the skill library.
+
+    Used to select real distractors based on semantic similarity.
+    """
+
+    def __init__(self, skill_library_path: str = "Claude-Skills"):
+        self.skill_library_path = skill_library_path
+        self.skills_data: list[dict] = []  # [{"name": ..., "description": ...}]
+        self.idf: dict[str, float] = {}
+        self._initialized = False
+
+    def _tokenize(self, text: str) -> list[str]:
+        """Simple tokenization: lowercase and split on non-alphanumeric."""
+        text = text.lower()
+        tokens = []
+        current = ""
+        for char in text:
+            if char.isalnum():
+                current += char
+            else:
+                if current:
+                    tokens.append(current)
+                    current = ""
+        if current:
+            tokens.append(current)
+        return tokens
+
+    def initialize(self):
+        """Load all skills from library and compute IDF."""
+        if self._initialized:
+            return
+
+        skill_files = []
+        for root, dirs, files in os.walk(self.skill_library_path):
+            if "SKILL.md" in files:
+                skill_files.append(os.path.join(root, "SKILL.md"))
+
+        all_docs = []
+        for skill_file in skill_files:
+            try:
+                with open(skill_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                # Parse YAML frontmatter
+                if content.startswith('---'):
+                    parts = content.split('---', 2)
+                    if len(parts) >= 3:
+                        import yaml
+                        try:
+                            frontmatter = yaml.safe_load(parts[1])
+                            name = frontmatter.get('name', '')
+                            description = frontmatter.get('description', '')
+                            if isinstance(description, str):
+                                self.skills_data.append({
+                                    "name": name,
+                                    "description": description,
+                                    "file_path": skill_file
+                                })
+                                all_docs.append(self._tokenize(description))
+                        except:
+                            pass
+            except Exception:
+                continue
+
+        # Compute IDF
+        num_docs = len(all_docs)
+        if num_docs > 0:
+            doc_freq = Counter()
+            for doc in all_docs:
+                unique_terms = set(doc)
+                for term in unique_terms:
+                    doc_freq[term] += 1
+
+            for term, df in doc_freq.items():
+                self.idf[term] = math.log(num_docs / (1 + df))
+
+        self._initialized = True
+
+    def get_tfidf_vector(self, text: str) -> dict[str, float]:
+        """Compute TF-IDF vector for a text."""
+        tokens = self._tokenize(text)
+        tf = Counter(tokens)
+        total = len(tokens) if tokens else 1
+
+        tfidf = {}
+        for term, count in tf.items():
+            idf = self.idf.get(term, math.log(len(self.skills_data) + 1))
+            tfidf[term] = (count / total) * idf
+
+        return tfidf
+
+    def cosine_similarity(self, vec1: dict[str, float], vec2: dict[str, float]) -> float:
+        """Compute cosine similarity between two TF-IDF vectors."""
+        common_terms = set(vec1.keys()) & set(vec2.keys())
+        if not common_terms:
+            return 0.0
+
+        dot_product = sum(vec1[t] * vec2[t] for t in common_terms)
+
+        norm1 = math.sqrt(sum(v ** 2 for v in vec1.values()))
+        norm2 = math.sqrt(sum(v ** 2 for v in vec2.values()))
+
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+
+        return dot_product / (norm1 * norm2)
+
+    def get_real_distractors(self, target_skill: Skill, n: int = 4) -> list[dict]:
+        """
+        Get N most similar skills from the library as real distractors.
+
+        Uses TF-IDF cosine similarity to find skills that are semantically
+        similar but not identical.
+        """
+        self.initialize()
+
+        target_vec = self.get_tfidf_vector(target_skill.description.original)
+
+        similarities = []
+        for skill_data in self.skills_data:
+            if skill_data["name"] == target_skill.name:
+                continue
+
+            skill_vec = self.get_tfidf_vector(skill_data["description"])
+            sim = self.cosine_similarity(target_vec, skill_vec)
+
+            similarities.append({
+                "name": skill_data["name"],
+                "description": skill_data["description"],
+                "similarity": sim
+            })
+
+        # Sort by similarity (highest first) and take top N
+        similarities.sort(key=lambda x: x["similarity"], reverse=True)
+
+        return [
+            {"name": s["name"], "description": s["description"]}
+            for s in similarities[:n]
+        ]
 
 
 class Stage1Optimizer:
@@ -61,12 +218,17 @@ class Stage1Optimizer:
 
     Uses delta debugging (DDMIN) algorithm to compress skill descriptions
     while preserving routing capability.
+
+    Two-phase validation:
+    - Phase 1: DDMIN with simulated oracle
+    - Phase 2: Real-world validation with selective restore
     """
 
     def __init__(
         self,
         llm_client: SkillLLMClient,
-        oracle_model: Optional[str] = None
+        oracle_model: Optional[str] = None,
+        skill_library_path: str = "Claude-Skills"
     ):
         """
         Initialize the Stage 1 optimizer.
@@ -74,9 +236,87 @@ class Stage1Optimizer:
         Args:
             llm_client: LLM client for segmentation and oracle testing.
             oracle_model: Model to use for oracle (defaults to client's model).
+            skill_library_path: Path to skill library for TF-IDF distractor selection.
         """
         self.llm_client = llm_client
         self.oracle_model = oracle_model or llm_client.model
+        self.tfidf_index = SkillLibraryTFIDF(skill_library_path)
+
+    # ============================================================
+    # Pre-generation for missing/short descriptions
+    # ============================================================
+
+    def ensure_description(self, skill: Skill, min_tokens: int = 40) -> Skill:
+        """
+        Ensure skill has a valid description with minimum tokens.
+
+        For missing or too-short descriptions, generates one from body.
+
+        Args:
+            skill: The skill to check/update.
+            min_tokens: Minimum token count required.
+
+        Returns:
+            Updated Skill with valid description.
+        """
+        current_desc = skill.description.original
+        current_tokens = count_tokens(current_desc) if current_desc else 0
+
+        if current_desc and current_tokens >= min_tokens:
+            return skill
+
+        # Generate description from body
+        generated_desc = self._generate_description_from_body(skill)
+
+        if generated_desc:
+            skill.description.original = generated_desc
+            skill.description.original_token_count = count_tokens(generated_desc)
+
+        return skill
+
+    def _generate_description_from_body(self, skill: Skill) -> Optional[str]:
+        """Generate a description from the skill body content."""
+        if not skill.body.original or not skill.body.original.strip():
+            return None
+
+        system_prompt = """You are an expert at writing concise skill descriptions for routing.
+
+Your task is to generate a brief, informative description for a skill based on its body content.
+
+Guidelines:
+1. The description should be 2-3 sentences (40-80 tokens)
+2. Focus on WHAT the skill does, not HOW
+3. Include key capabilities and primary use cases
+4. Be specific enough to distinguish from similar skills
+5. Use clear, professional language
+
+IMPORTANT: Respond with a JSON object:
+{
+  "description": "The generated description text"
+}"""
+
+        user_prompt = f"""Skill Name: {skill.name}
+Category: {skill.metadata.category or 'general'}
+
+Skill Body Content:
+{skill.body.original[:3000]}
+
+Generate a concise description for routing purposes."""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+
+        response_text = response.choices[0].message.content
+        result_dict = json.loads(response_text)
+
+        return result_dict.get("description")
 
     def segment_description(
         self,
@@ -144,7 +384,7 @@ Return a JSON object with the list of clauses."""
     def generate_adversarial_skill(
         self,
         skill: Skill,
-        num_candidates: int = 3
+        num_candidates: int = 1
     ) -> list[dict]:
         """
         Generate adversarial skills (distractors) for routing test.
@@ -155,7 +395,7 @@ Return a JSON object with the list of clauses."""
 
         Args:
             skill: The target skill.
-            num_candidates: Number of adversarial skills to generate.
+            num_candidates: Number of adversarial skills to generate (default 1 per paper).
 
         Returns:
             List of adversarial skill dictionaries with name and description.
@@ -212,23 +452,54 @@ Generate {num_candidates} adversarial skills that could be confused with this ta
 
         return result_dict.get("adversarial_skills", [])
 
+    def get_distractors(
+        self,
+        skill: Skill,
+        num_real: int = 4,
+        num_adversarial: int = 1
+    ) -> list[dict]:
+        """
+        Get combined distractors: TF-IDF real distractors + LLM adversarial.
+
+        Per SkillReducer paper: 4 real distractors from skill library + 1 adversarial.
+
+        Args:
+            skill: The target skill.
+            num_real: Number of real distractors from TF-IDF (default 4).
+            num_adversarial: Number of LLM-generated adversarial skills (default 1).
+
+        Returns:
+            List of distractor skill dictionaries.
+        """
+        distractors = []
+
+        # Get real distractors from skill library using TF-IDF
+        real_distractors = self.tfidf_index.get_real_distractors(skill, n=num_real)
+        distractors.extend(real_distractors)
+
+        # Get LLM-generated adversarial skill
+        adversarial = self.generate_adversarial_skill(skill, num_candidates=num_adversarial)
+        distractors.extend(adversarial)
+
+        return distractors
+
     def test_routing(
         self,
         compressed_description: str,
         target_skill: Skill,
-        adversarial_skills: list[dict],
+        distractors: list[dict],
         query: Optional[str] = None
     ) -> RoutingTestResult:
         """
         Simulated Oracle O_sim: Test if compressed description routes correctly.
 
-        Given a compressed description, target skill, and adversarial skills,
+        Given a compressed description, target skill, and distractor skills,
         tests whether the LLM can correctly route to the target skill.
 
         Args:
             compressed_description: The compressed description to test.
             target_skill: The target skill that should be selected.
-            adversarial_skills: List of distractor skills.
+            distractors: List of distractor skills (real + adversarial).
             query: Optional query that triggered the routing (generated if not provided).
 
         Returns:
@@ -259,7 +530,7 @@ IMPORTANT: You must respond with a JSON object in the following format:
             "name": target_skill.name,
             "description": compressed_description
         })
-        for adv in adversarial_skills:
+        for adv in distractors:
             skills_list.append({
                 "name": adv["name"],
                 "description": adv["description"]
@@ -337,6 +608,10 @@ Generate a realistic user query that would need this skill."""
 
         return result_dict.get("query", f"Help me with {skill.name}")
 
+    # ============================================================
+    # Phase 1: DDMIN Algorithm
+    # ============================================================
+
     def ddmin(
         self,
         clauses: list[SemanticClause],
@@ -388,6 +663,181 @@ Generate a realistic user query that would need this skill."""
 
         # Already at max granularity, return current set
         return clauses
+
+    # ============================================================
+    # Phase 2: Real-world Validation with Selective Restore
+    # ============================================================
+
+    def phase2_validate_with_restore(
+        self,
+        minimal_clauses: list[SemanticClause],
+        original_clauses: list[SemanticClause],
+        skill: Skill,
+        distractors: list[dict],
+        num_queries: int = 5
+    ) -> tuple[list[SemanticClause], bool]:
+        """
+        Phase 2: Real-world validation with selective restore.
+
+        Tests the minimal clauses with multiple diverse queries.
+        If routing fails, selectively restores clauses that address the failure.
+
+        Args:
+            minimal_clauses: The 1-minimal clause subset from Phase 1.
+            original_clauses: All original clauses before reduction.
+            skill: The target skill.
+            distractors: Distractor skills for routing test.
+            num_queries: Number of diverse test queries to use.
+
+        Returns:
+            Tuple of (final_clauses, all_tests_passed).
+        """
+        current_clauses = list(minimal_clauses)
+        removed_clauses = [c for c in original_clauses if c not in minimal_clauses]
+
+        # Generate diverse test queries
+        queries = self._generate_diverse_queries(skill, num_queries)
+
+        all_passed = True
+
+        for query in queries:
+            temp_description = " ".join(c.content for c in current_clauses)
+            result = self.test_routing(
+                compressed_description=temp_description,
+                target_skill=skill,
+                distractors=distractors,
+                query=query
+            )
+
+            if not result.success:
+                all_passed = False
+                # Selective restore: find which removed clause would help
+                restored = self._selective_restore(
+                    current_clauses=current_clauses,
+                    removed_clauses=removed_clauses,
+                    skill=skill,
+                    distractors=distractors,
+                    failed_query=query
+                )
+
+                if restored:
+                    current_clauses.extend(restored)
+                    # Remove restored from available removed_clauses
+                    restored_ids = {c.clause_id for c in restored}
+                    removed_clauses = [c for c in removed_clauses if c.clause_id not in restored_ids]
+
+        return current_clauses, all_passed
+
+    def _generate_diverse_queries(self, skill: Skill, num_queries: int) -> list[str]:
+        """Generate diverse test queries for Phase 2 validation."""
+        system_prompt = """You are a user of an AI assistant system.
+
+Generate diverse, realistic queries that a user might ask when they need this skill.
+
+Requirements:
+1. Generate exactly the requested number of queries
+2. Each query should be different in style/focus
+3. Some should be direct, some indirect
+4. Some should use technical terms, some should use lay language
+5. All should realistically route to this skill
+
+IMPORTANT: Respond with a JSON object:
+{
+  "queries": ["query 1", "query 2", ...]
+}"""
+
+        user_prompt = f"""Skill Name: {skill.name}
+Skill Description: {skill.description.original}
+
+Generate {num_queries} diverse user queries for this skill."""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+
+        response_text = response.choices[0].message.content
+        result_dict = json.loads(response_text)
+
+        return result_dict.get("queries", [f"Help me with {skill.name}"] * num_queries)
+
+    def _selective_restore(
+        self,
+        current_clauses: list[SemanticClause],
+        removed_clauses: list[SemanticClause],
+        skill: Skill,
+        distractors: list[dict],
+        failed_query: str
+    ) -> list[SemanticClause]:
+        """
+        Selectively restore clauses that address routing failure.
+
+        Uses LLM to identify which removed clauses are most relevant
+        to the failed query.
+
+        Args:
+            current_clauses: Current clause set.
+            removed_clauses: Clauses that were removed.
+            skill: The target skill.
+            distractors: Distractor skills.
+            failed_query: The query that caused routing failure.
+
+        Returns:
+            List of clauses to restore.
+        """
+        if not removed_clauses:
+            return []
+
+        system_prompt = """You are an expert at analyzing routing failures.
+
+Given a failed routing query and removed description clauses, identify which
+clauses should be restored to help the routing succeed.
+
+A clause should be restored if:
+1. It contains key distinguishing information about the skill
+2. It addresses the specific topic the user asked about
+3. It helps differentiate this skill from similar ones
+
+IMPORTANT: Respond with a JSON object:
+{
+  "clauses_to_restore": ["clause_id_1", "clause_id_2"],
+  "reasoning": "Why these clauses should be restored"
+}"""
+
+        current_text = " ".join(c.content for c in current_clauses)
+        removed_text = "\n".join([f"[{c.clause_id}] {c.content}" for c in removed_clauses])
+
+        user_prompt = f"""Target Skill: {skill.name}
+Current Description: {current_text}
+
+Failed Query: "{failed_query}"
+
+Removed Clauses:
+{removed_text}
+
+Which removed clauses should be restored to help routing succeed for this query?"""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+
+        response_text = response.choices[0].message.content
+        result_dict = json.loads(response_text)
+
+        restore_ids = set(result_dict.get("clauses_to_restore", []))
+
+        return [c for c in removed_clauses if c.clause_id in restore_ids]
 
     def rewrite_and_polish(
         self,
@@ -458,29 +908,33 @@ Write a polished, professional skill description."""
     def compress_description(
         self,
         skill: Skill,
-        use_oracle_validation: bool = True
+        use_oracle_validation: bool = True,
+        enable_phase2: bool = True
     ) -> CompressionResult:
         """
         Full Stage 1 compression pipeline for a skill description.
 
         Steps:
+        0. Ensure description exists (pre-generate if missing/short)
         1. Segment description into semantic clauses
-        2. Generate adversarial skills for oracle testing
-        3. Apply DDMIN to find 1-minimal subset
-        4. Rewrite and polish the result
+        2. Get distractors (4 TF-IDF real + 1 LLM adversarial)
+        3. Apply DDMIN (Phase 1) to find 1-minimal subset
+        4. Phase 2: Real-world validation with selective restore
+        5. Rewrite and polish the result
 
         Args:
             skill: The skill to compress.
             use_oracle_validation: Whether to use oracle validation in DDMIN.
+            enable_phase2: Whether to run Phase 2 validation with selective restore.
 
         Returns:
             CompressionResult with original and compressed descriptions.
         """
-        import tiktoken
-        encoding = tiktoken.get_encoding("cl100k_base")
+        # Step 0: Ensure description has minimum tokens
+        skill = self.ensure_description(skill, min_tokens=40)
 
         original_description = skill.description.original
-        original_tokens = len(encoding.encode(original_description))
+        original_tokens = count_tokens(original_description)
 
         # Step 1: Segment description
         clauses = self.segment_description(original_description)
@@ -495,10 +949,10 @@ Write a polished, professional skill description."""
                 compression_ratio=0.0
             )
 
-        # Step 2: Generate adversarial skills
-        adversarial_skills = self.generate_adversarial_skill(skill)
+        # Step 2: Get distractors (4 TF-IDF real + 1 LLM adversarial)
+        distractors = self.get_distractors(skill, num_real=4, num_adversarial=1)
 
-        # Step 3: Define test function for DDMIN
+        # Step 3: Define test function for DDMIN (Phase 1)
         def test_routing_with_clauses(clause_subset: list[SemanticClause]) -> bool:
             """Test if clause subset maintains routing capability."""
             if not clause_subset:
@@ -512,22 +966,39 @@ Write a polished, professional skill description."""
                 result = self.test_routing(
                     compressed_description=temp_description,
                     target_skill=skill,
-                    adversarial_skills=adversarial_skills
+                    distractors=distractors
                 )
                 return result.success
             else:
                 # Without oracle, always pass (not recommended)
                 return True
 
-        # Step 4: Apply DDMIN
+        # Step 4: Apply DDMIN (Phase 1)
         minimal_clauses = self.ddmin(clauses, test_routing_with_clauses)
+        phase1_passed = len(minimal_clauses) > 0
 
-        # Step 5: Rewrite and polish
-        compressed_description = self.rewrite_and_polish(minimal_clauses)
-        compressed_tokens = len(encoding.encode(compressed_description))
+        # Step 5: Phase 2 - Real-world validation with selective restore
+        phase2_passed = True
+        restored_clauses = []
+
+        if enable_phase2 and use_oracle_validation:
+            final_clauses, phase2_passed = self.phase2_validate_with_restore(
+                minimal_clauses=minimal_clauses,
+                original_clauses=clauses,
+                skill=skill,
+                distractors=distractors,
+                num_queries=5
+            )
+            restored_clauses = [c.content for c in final_clauses if c not in minimal_clauses]
+        else:
+            final_clauses = minimal_clauses
+
+        # Step 6: Rewrite and polish
+        compressed_description = self.rewrite_and_polish(final_clauses)
+        compressed_tokens = count_tokens(compressed_description)
 
         # Calculate metrics
-        clauses_removed = len(clauses) - len(minimal_clauses)
+        clauses_removed = len(clauses) - len(final_clauses)
         compression_ratio = 0.0
         if original_tokens > 0:
             compression_ratio = 1.0 - (compressed_tokens / original_tokens)
@@ -538,13 +1009,17 @@ Write a polished, professional skill description."""
             original_token_count=original_tokens,
             compressed_token_count=compressed_tokens,
             clauses_removed=clauses_removed,
-            compression_ratio=round(compression_ratio, 4)
+            compression_ratio=round(compression_ratio, 4),
+            phase1_passed=phase1_passed,
+            phase2_passed=phase2_passed,
+            restored_clauses=restored_clauses
         )
 
     def compress_skill(
         self,
         skill: Skill,
-        use_oracle_validation: bool = True
+        use_oracle_validation: bool = True,
+        enable_phase2: bool = True
     ) -> Skill:
         """
         Compress a skill's description and return updated Skill object.
@@ -552,11 +1027,12 @@ Write a polished, professional skill description."""
         Args:
             skill: The skill to compress.
             use_oracle_validation: Whether to use oracle validation.
+            enable_phase2: Whether to run Phase 2 validation.
 
         Returns:
             Updated Skill object with compressed description.
         """
-        result = self.compress_description(skill, use_oracle_validation)
+        result = self.compress_description(skill, use_oracle_validation, enable_phase2)
 
         # Update skill description
         skill.description.compressed = result.compressed_description

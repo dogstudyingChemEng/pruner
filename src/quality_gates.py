@@ -3,6 +3,10 @@ Quality Gates for SkillReducer framework.
 
 Implements faithfulness verification and feedback loop mechanisms
 from the SkillReducer paper to ensure compression quality.
+
+Key improvements aligned with paper:
+- Gate 1: Per-content-type fine-grained rollback
+- Gate 2: Fully automated evaluation loop with task generation
 """
 
 import json
@@ -46,6 +50,7 @@ class FaithfulnessResult:
     missing_concepts: list[str]
     reasoning: str
     should_rollback: bool
+    rollback_types: list[str] = field(default_factory=list)  # Content types that need rollback
 
 
 @dataclass
@@ -59,6 +64,35 @@ class FeedbackLoopResult:
 
 
 @dataclass
+class EvaluationTask:
+    """A single evaluation task for Gate 2."""
+
+    task_id: str
+    query: str
+    expected_outcome: str
+
+
+@dataclass
+class TaskResult:
+    """Result of evaluating a single task."""
+
+    task_id: str
+    passed: bool
+    failure_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AutomatedLoopResult:
+    """Result of the automated Gate 2 feedback loop."""
+
+    loop_iteration: int
+    all_tasks_passed: bool
+    task_results: list[TaskResult]
+    promoted_blocks: list[str]
+    final_blocks: list[ContentBlock]
+
+
+@dataclass
 class PipelineResult:
     """Result of the complete compression pipeline."""
 
@@ -67,11 +101,13 @@ class PipelineResult:
     stage2_compressed: bool
     faithfulness_passed: bool
     rollback_performed: bool
-    compression_metrics: Optional[CompressionMetrics]
     original_tokens: int
     final_tokens: int
     overall_compression_ratio: float
+    rollback_types: list[str] = field(default_factory=list)
+    compression_metrics: Optional[CompressionMetrics] = None
     errors: list[str] = field(default_factory=list)
+    gate2_result: Optional[AutomatedLoopResult] = None
 
 
 class QualityGates:
@@ -80,12 +116,22 @@ class QualityGates:
 
     Implements Gate 1 (Faithfulness Verification) and Gate 2 (Feedback Loop)
     from the SkillReducer paper.
+
+    Gate 1 improvements:
+    - Per-content-type fine-grained rollback
+    - Only rollback the types that have missing concepts
+
+    Gate 2 improvements:
+    - Automated task generation (5 tasks)
+    - Automated evaluation and promotion loop
+    - Max 2 iterations
     """
 
     def __init__(
         self,
         llm_client,
-        faithfulness_threshold: float = 1.0
+        faithfulness_threshold: float = 1.0,
+        max_loop_iterations: int = 2
     ):
         """
         Initialize quality gates.
@@ -94,12 +140,14 @@ class QualityGates:
             llm_client: LLM client for verification.
             faithfulness_threshold: Minimum ratio of preserved concepts (0.0-1.0).
                                   Default 1.0 means all concepts must be preserved.
+            max_loop_iterations: Maximum iterations for Gate 2 feedback loop (default 2).
         """
         self.llm_client = llm_client
         self.faithfulness_threshold = faithfulness_threshold
+        self.max_loop_iterations = max_loop_iterations
 
     # ============================================================
-    # Gate 1: Faithfulness Verification
+    # Gate 1: Faithfulness Verification with Fine-grained Rollback
     # ============================================================
 
     def verify_faithfulness(
@@ -113,7 +161,7 @@ class QualityGates:
 
         Checks if all 'core operational concepts' from the original body
         are preserved in the compressed core rules. If concepts are missing,
-        triggers rollback.
+        identifies which content types need rollback.
 
         Args:
             original_body: The original skill body text.
@@ -121,7 +169,7 @@ class QualityGates:
             skill_name: Skill name for context.
 
         Returns:
-            FaithfulnessResult with verification details.
+            FaithfulnessResult with verification details and rollback types.
         """
         if not original_body or not original_body.strip():
             return FaithfulnessResult(
@@ -130,7 +178,8 @@ class QualityGates:
                 preserved_concepts=[],
                 missing_concepts=[],
                 reasoning="Empty original body, verification skipped",
-                should_rollback=False
+                should_rollback=False,
+                rollback_types=[]
             )
 
         if not compressed_core_rules or not compressed_core_rules.strip():
@@ -140,7 +189,8 @@ class QualityGates:
                 preserved_concepts=[],
                 missing_concepts=["No compressed rules provided"],
                 reasoning="Compressed rules are empty",
-                should_rollback=True
+                should_rollback=True,
+                rollback_types=["core_rule"]
             )
 
         system_prompt = """You are a quality assurance expert for technical documentation compression.
@@ -161,6 +211,12 @@ Do NOT flag as missing:
 - Optional details or nice-to-have context
 - Redundant or repeated information
 
+For each missing concept, identify which content TYPE it belongs to:
+- core_rule: Actionable instructions, rules, procedures
+- example: Code examples, usage demonstrations
+- template: Boilerplate, ready-to-use templates
+- background: Explanations, contextual knowledge
+
 IMPORTANT: Respond with a JSON object:
 {
   "original_concepts": [
@@ -171,7 +227,10 @@ IMPORTANT: Respond with a JSON object:
     "concept that was preserved in compressed"
   ],
   "missing_concepts": [
-    "concept that was lost in compression"
+    {
+      "concept": "the missing concept",
+      "likely_type": "core_rule|example|template|background"
+    }
   ],
   "faithfulness_score": 0.95,
   "reasoning": "Explanation of the verification result"
@@ -185,7 +244,7 @@ ORIGINAL BODY:
 COMPRESSED CORE RULES:
 {compressed_core_rules}
 
-Identify all core operational concepts in the original and check if they are preserved in the compressed version."""
+Identify all core operational concepts in the original and check if they are preserved in the compressed version. For missing concepts, identify their likely content type."""
 
         response = self.llm_client.client.chat.completions.create(
             model=self.llm_client.model,
@@ -202,9 +261,22 @@ Identify all core operational concepts in the original and check if they are pre
 
         original_concepts = result.get("original_concepts", [])
         preserved_concepts = result.get("preserved_concepts", [])
-        missing_concepts = result.get("missing_concepts", [])
+        missing_concepts_raw = result.get("missing_concepts", [])
         faithfulness_score = result.get("faithfulness_score", 1.0)
         reasoning = result.get("reasoning", "")
+
+        # Extract missing concepts and their types
+        missing_concepts = []
+        rollback_types = set()
+
+        for mc in missing_concepts_raw:
+            if isinstance(mc, dict):
+                missing_concepts.append(mc.get("concept", str(mc)))
+                likely_type = mc.get("likely_type", "core_rule")
+                rollback_types.add(likely_type)
+            else:
+                missing_concepts.append(str(mc))
+                rollback_types.add("core_rule")
 
         # Determine if passed
         passed = len(missing_concepts) == 0 and faithfulness_score >= self.faithfulness_threshold
@@ -217,12 +289,205 @@ Identify all core operational concepts in the original and check if they are pre
             preserved_concepts=preserved_concepts,
             missing_concepts=missing_concepts,
             reasoning=reasoning,
-            should_rollback=should_rollback
+            should_rollback=should_rollback,
+            rollback_types=list(rollback_types)
         )
 
+    def fine_grained_rollback(
+        self,
+        compressed_blocks: list[ContentBlock],
+        original_blocks: list[ContentBlock],
+        rollback_types: list[str]
+    ) -> list[ContentBlock]:
+        """
+        Perform fine-grained rollback by content type.
+
+        Only rolls back blocks of the specified types, keeping successful
+        compressions for other types.
+
+        Args:
+            compressed_blocks: The compressed blocks.
+            original_blocks: The original classified blocks before compression.
+            rollback_types: List of content types to rollback.
+
+        Returns:
+            List of blocks with selective rollback applied.
+        """
+        if not rollback_types:
+            return compressed_blocks
+
+        rollback_type_values = set(rollback_types)
+        result_blocks = []
+
+        for block in compressed_blocks:
+            block_type = block.content_type if isinstance(block.content_type, str) else block.content_type.value
+
+            if block_type in rollback_type_values:
+                # Find original block of same type and similar content
+                original_match = None
+                for orig_block in original_blocks:
+                    orig_type = orig_block.content_type if isinstance(orig_block.content_type, str) else orig_block.content_type.value
+                    if orig_type == block_type:
+                        original_match = orig_block
+                        break
+
+                if original_match:
+                    result_blocks.append(ContentBlock(
+                        chunk_id=original_match.chunk_id,
+                        content=original_match.content,
+                        content_type=original_match.content_type,
+                        token_count=original_match.token_count
+                    ))
+                else:
+                    result_blocks.append(block)
+            else:
+                result_blocks.append(block)
+
+        return result_blocks
+
     # ============================================================
-    # Gate 2: Feedback Loop (Task-based Evaluation)
+    # Gate 2: Automated Feedback Loop
     # ============================================================
+
+    def generate_evaluation_tasks(
+        self,
+        skill: Skill,
+        num_tasks: int = 5
+    ) -> list[EvaluationTask]:
+        """
+        Generate evaluation tasks for Gate 2.
+
+        Creates diverse tasks that test the skill's capabilities.
+
+        Args:
+            skill: The skill to generate tasks for.
+            num_tasks: Number of tasks to generate (default 5).
+
+        Returns:
+            List of EvaluationTask objects.
+        """
+        system_prompt = """You are an expert at creating evaluation tasks for AI skills.
+
+Your task is to generate diverse, realistic tasks that test a skill's capabilities.
+
+Guidelines:
+1. Tasks should be specific and testable
+2. Cover different aspects of the skill
+3. Some tasks should be simple, some complex
+4. Include clear expected outcomes
+5. Tasks should be realistic user requests
+
+IMPORTANT: Respond with a JSON object:
+{
+  "tasks": [
+    {
+      "task_id": "task_1",
+      "query": "The user's request",
+      "expected_outcome": "What successful completion looks like"
+    }
+  ]
+}"""
+
+        user_prompt = f"""Skill Name: {skill.name}
+Skill Description: {skill.description.original}
+
+Skill Body Summary (first 2000 chars):
+{skill.body.original[:2000]}
+
+Generate {num_tasks} diverse evaluation tasks for this skill."""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+
+        response_text = response.choices[0].message.content
+        result = json.loads(response_text)
+
+        tasks = []
+        for t in result.get("tasks", [])[:num_tasks]:
+            tasks.append(EvaluationTask(
+                task_id=t.get("task_id", f"task_{len(tasks)}"),
+                query=t.get("query", ""),
+                expected_outcome=t.get("expected_outcome", "")
+            ))
+
+        return tasks
+
+    def evaluate_task(
+        self,
+        task: EvaluationTask,
+        skill: Skill,
+        core_rules: str
+    ) -> TaskResult:
+        """
+        Evaluate a single task against the compressed skill.
+
+        Simulates whether the skill with compressed core rules can
+        successfully complete the task.
+
+        Args:
+            task: The evaluation task.
+            skill: The skill being evaluated.
+            core_rules: The compressed core rules.
+
+        Returns:
+            TaskResult with pass/fail and failure reasons.
+        """
+        system_prompt = """You are an expert at evaluating AI skill performance.
+
+Your task is to determine if a skill's core rules contain enough information
+to successfully complete a given task.
+
+Guidelines:
+1. Check if the core rules provide necessary instructions for the task
+2. Identify any missing information or capabilities
+3. Be strict - the skill should be able to complete the task without additional context
+
+IMPORTANT: Respond with a JSON object:
+{
+  "passed": true/false,
+  "failure_reasons": [
+    "Reason 1 why the skill cannot complete this task",
+    "Reason 2..."
+  ],
+  "reasoning": "Explanation of the evaluation"
+}"""
+
+        user_prompt = f"""Skill: {skill.name}
+
+Task Query: {task.query}
+
+Expected Outcome: {task.expected_outcome}
+
+Core Rules Available:
+{core_rules}
+
+Can this skill successfully complete the task with only these core rules?"""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+
+        response_text = response.choices[0].message.content
+        result = json.loads(response_text)
+
+        return TaskResult(
+            task_id=task.task_id,
+            passed=result.get("passed", False),
+            failure_reasons=result.get("failure_reasons", [])
+        )
 
     def feedback_loop(
         self,
@@ -363,6 +628,109 @@ Identify which blocks contain information relevant to addressing these failures.
             feedback_addressed=criteria_addressed
         )
 
+    def run_automated_feedback_loop(
+        self,
+        skill: Skill,
+        initial_blocks: list[ContentBlock],
+        stage2_optimizer: Stage2Optimizer,
+        max_iterations: int = 2
+    ) -> AutomatedLoopResult:
+        """
+        Run the fully automated Gate 2 feedback loop.
+
+        Steps:
+        1. Generate 5 evaluation tasks
+        2. Evaluate all tasks
+        3. If any fail, promote relevant blocks
+        4. Re-compress core rules
+        5. Re-evaluate
+        6. Repeat up to max_iterations times
+
+        Args:
+            skill: The skill being evaluated.
+            initial_blocks: The initial compressed blocks.
+            stage2_optimizer: Stage2 optimizer for re-compression.
+            max_iterations: Maximum loop iterations (default 2).
+
+        Returns:
+            AutomatedLoopResult with final blocks and status.
+        """
+        current_blocks = list(initial_blocks)
+        all_promoted = []
+
+        for iteration in range(1, max_iterations + 1):
+            # Generate evaluation tasks
+            tasks = self.generate_evaluation_tasks(skill, num_tasks=5)
+
+            # Get current core rules
+            core_rules = "\n".join([
+                b.content for b in current_blocks
+                if _is_content_type(b, ContentType.CORE_RULE)
+            ])
+
+            # Evaluate all tasks
+            task_results = []
+            all_failure_reasons = []
+
+            for task in tasks:
+                result = self.evaluate_task(task, skill, core_rules)
+                task_results.append(result)
+                if not result.passed:
+                    all_failure_reasons.extend(result.failure_reasons)
+
+            # Check if all passed
+            all_passed = all(r.passed for r in task_results)
+
+            if all_passed:
+                return AutomatedLoopResult(
+                    loop_iteration=iteration,
+                    all_tasks_passed=True,
+                    task_results=task_results,
+                    promoted_blocks=all_promoted,
+                    final_blocks=current_blocks
+                )
+
+            # Not all passed - do promotion
+            if all_failure_reasons:
+                feedback_result = self.feedback_loop(
+                    current_blocks,
+                    all_failure_reasons,
+                    skill_context=f"{skill.name}: {skill.description.original}"
+                )
+
+                if feedback_result.promotion_count > 0:
+                    all_promoted.extend(feedback_result.promoted_blocks)
+
+                    # Re-compress core rules with newly promoted blocks
+                    core_blocks = [b for b in current_blocks if _is_content_type(b, ContentType.CORE_RULE)]
+                    if core_blocks:
+                        compressed_core = stage2_optimizer.compress_core_rules(core_blocks)
+
+                        # Update blocks: remove old core, add new compressed
+                        non_core = [b for b in current_blocks if not _is_content_type(b, ContentType.CORE_RULE)]
+                        current_blocks = compressed_core + non_core
+
+            # If no promotions happened, we can't improve further
+            if not all_failure_reasons or (feedback_result and feedback_result.promotion_count == 0):
+                break
+
+        # Final evaluation
+        tasks = self.generate_evaluation_tasks(skill, num_tasks=5)
+        core_rules = "\n".join([
+            b.content for b in current_blocks
+            if _is_content_type(b, ContentType.CORE_RULE)
+        ])
+        task_results = [self.evaluate_task(t, skill, core_rules) for t in tasks]
+        all_passed = all(r.passed for r in task_results)
+
+        return AutomatedLoopResult(
+            loop_iteration=max_iterations,
+            all_tasks_passed=all_passed,
+            task_results=task_results,
+            promoted_blocks=all_promoted,
+            final_blocks=current_blocks
+        )
+
     # ============================================================
     # Utility Methods
     # ============================================================
@@ -443,8 +811,8 @@ class CompressionPipeline:
         Pipeline steps:
         1. Stage 1: Compress description
         2. Stage 2: Classify and compress body
-        3. Gate 1: Verify faithfulness
-        4. Gate 2: Apply feedback loop (if failed_criteria provided)
+        3. Gate 1: Verify faithfulness (with per-type rollback)
+        4. Gate 2: Automated feedback loop (if enabled)
         5. Finalize results
 
         Args:
@@ -454,7 +822,7 @@ class CompressionPipeline:
             dedup_templates: Whether to deduplicate templates.
             summarize_background: Whether to summarize background.
             dedup_references: Whether to deduplicate references.
-            failed_criteria: Optional list of failed task criteria for Gate 2.
+            failed_criteria: Optional list of failed task criteria for Gate 2 (deprecated - auto-generated now).
 
         Returns:
             PipelineResult with complete compression results.
@@ -473,9 +841,12 @@ class CompressionPipeline:
         stage2_compressed = False
         faithfulness_passed = True
         rollback_performed = False
+        rollback_types = []
         compression_metrics = None
         final_blocks = []
         updated_references = skill.references
+        gate2_result = None
+        original_blocks = []  # Store original classification for fine-grained rollback
 
         try:
             # ============================================================
@@ -492,6 +863,9 @@ class CompressionPipeline:
             # ============================================================
             on_demand_modules = None
             try:
+                # First, classify without compression to store originals
+                original_blocks = self.stage2_optimizer.classify_skill_body(skill)
+
                 # New return structure: (core_blocks, on_demand_modules, references, metrics)
                 core_blocks, on_demand_modules, updated_references, compression_metrics = self.stage2_optimizer.optimize_skill(
                     skill,
@@ -511,7 +885,7 @@ class CompressionPipeline:
                 updated_references = skill.references
 
             # ============================================================
-            # Gate 1: Faithfulness Verification
+            # Gate 1: Faithfulness Verification (Fine-grained Rollback)
             # ============================================================
             if self.enable_gate1 and stage2_compressed and final_blocks:
                 faithfulness_result = self.quality_gates.run_faithfulness_gate(
@@ -521,28 +895,40 @@ class CompressionPipeline:
                 if faithfulness_result.should_rollback:
                     faithfulness_passed = False
                     rollback_performed = True
+                    rollback_types = faithfulness_result.rollback_types
 
-                    # Rollback: re-classify without compression
-                    final_blocks = self.stage2_optimizer.classify_skill_body(skill)
+                    # Fine-grained rollback: only rollback specific types
+                    final_blocks = self.quality_gates.fine_grained_rollback(
+                        compressed_blocks=final_blocks,
+                        original_blocks=original_blocks,
+                        rollback_types=rollback_types
+                    )
                     on_demand_modules = OnDemandModules()
 
                     errors.append(
-                        f"Gate 1 failed - missing concepts: {faithfulness_result.missing_concepts}"
+                        f"Gate 1 failed - missing concepts: {faithfulness_result.missing_concepts}, rolled back types: {rollback_types}"
                     )
 
             # ============================================================
-            # Gate 2: Feedback Loop (if failed criteria provided)
+            # Gate 2: Automated Feedback Loop
             # ============================================================
-            if self.enable_gate2 and failed_criteria and final_blocks:
-                feedback_result = self.quality_gates.feedback_loop(
-                    final_blocks,
-                    failed_criteria,
-                    skill_context=f"{skill.name}: {skill.description.original}"
+            if self.enable_gate2 and final_blocks:
+                gate2_result = self.quality_gates.run_automated_feedback_loop(
+                    skill=skill,
+                    initial_blocks=final_blocks,
+                    stage2_optimizer=self.stage2_optimizer,
+                    max_iterations=2
                 )
 
-                if feedback_result.promotion_count > 0:
+                if gate2_result.promoted_blocks:
+                    final_blocks = gate2_result.final_blocks
                     errors.append(
-                        f"Gate 2 promoted {feedback_result.promotion_count} blocks to core_rule"
+                        f"Gate 2 promoted {len(gate2_result.promoted_blocks)} blocks across {gate2_result.loop_iteration} iteration(s)"
+                    )
+
+                if not gate2_result.all_tasks_passed:
+                    errors.append(
+                        f"Gate 2: {sum(1 for r in gate2_result.task_results if not r.passed)}/{len(gate2_result.task_results)} tasks failed after {gate2_result.loop_iteration} iteration(s)"
                     )
 
         except Exception as e:
@@ -570,11 +956,13 @@ class CompressionPipeline:
             stage2_compressed=stage2_compressed,
             faithfulness_passed=faithfulness_passed,
             rollback_performed=rollback_performed,
+            rollback_types=rollback_types,
             compression_metrics=compression_metrics,
             original_tokens=original_tokens,
             final_tokens=final_tokens,
             overall_compression_ratio=round(overall_ratio, 4),
-            errors=errors
+            errors=errors,
+            gate2_result=gate2_result
         )
 
 
@@ -597,7 +985,7 @@ def run_pipeline(
         llm_client: LLM client for all operations.
         enable_gate1: Whether to enable Gate 1.
         enable_gate2: Whether to enable Gate 2.
-        failed_criteria: Optional failed criteria for Gate 2.
+        failed_criteria: Optional failed criteria for Gate 2 (deprecated - auto-generated now).
 
     Returns:
         PipelineResult with complete compression results.

@@ -131,6 +131,25 @@ class Body(BaseModel):
         return [b for b in self.content_blocks if b.content_type == content_type]
 
 
+class RoutingMetadata(BaseModel):
+    """
+    Routing metadata for on-demand reference modules.
+
+    Per SkillReducer paper, each reference file should have:
+    - when: Trigger condition description (when to load this file)
+    - topics: 3-5 topic keywords for matching
+    """
+
+    when: str = Field(
+        default="",
+        description="Trigger condition - when to load this reference"
+    )
+    topics: list[str] = Field(
+        default_factory=list,
+        description="3-5 topic keywords for matching"
+    )
+
+
 class OnDemandModules(BaseModel):
     """
     On-demand modules for progressive disclosure.
@@ -166,9 +185,12 @@ class OnDemandModules(BaseModel):
             sum(b.token_count for b in self.background)
         )
 
-    def to_reference_files(self) -> dict[str, str]:
+    def to_reference_files(self, routing_metadata: Optional[dict[str, "RoutingMetadata"]] = None) -> dict[str, str]:
         """
-        Convert on-demand modules to reference file format.
+        Convert on-demand modules to reference file format with routing metadata.
+
+        Args:
+            routing_metadata: Optional dict mapping filename to RoutingMetadata.
 
         Returns:
             Dictionary mapping filename to content for each non-empty module.
@@ -180,6 +202,11 @@ class OnDemandModules(BaseModel):
                 f"## Example {i+1}\n\n{b.content}"
                 for i, b in enumerate(self.examples)
             ])
+            # Add routing metadata header if available
+            if routing_metadata and "on-demand-examples.md" in routing_metadata:
+                meta = routing_metadata["on-demand-examples.md"]
+                header = f"<!--\nWHEN: {meta.when}\nTOPICS: {', '.join(meta.topics)}\n-->\n\n"
+                content = header + content
             files["on-demand-examples.md"] = content
 
         if self.templates:
@@ -187,6 +214,11 @@ class OnDemandModules(BaseModel):
                 f"## Template {i+1}\n\n{b.content}"
                 for i, b in enumerate(self.templates)
             ])
+            # Add routing metadata header if available
+            if routing_metadata and "on-demand-templates.md" in routing_metadata:
+                meta = routing_metadata["on-demand-templates.md"]
+                header = f"<!--\nWHEN: {meta.when}\nTOPICS: {', '.join(meta.topics)}\n-->\n\n"
+                content = header + content
             files["on-demand-templates.md"] = content
 
         if self.background:
@@ -194,6 +226,11 @@ class OnDemandModules(BaseModel):
                 f"## Background {i+1}\n\n{b.content}"
                 for i, b in enumerate(self.background)
             ])
+            # Add routing metadata header if available
+            if routing_metadata and "on-demand-background.md" in routing_metadata:
+                meta = routing_metadata["on-demand-background.md"]
+                header = f"<!--\nWHEN: {meta.when}\nTOPICS: {', '.join(meta.topics)}\n-->\n\n"
+                content = header + content
             files["on-demand-background.md"] = content
 
         return files

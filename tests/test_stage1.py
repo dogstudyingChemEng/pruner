@@ -15,6 +15,7 @@ from src.stage1_router import (
 )
 from src.models import Skill, Description, Body, SkillMetadata
 from src.llm_client import SkillLLMClient
+from src.chunker import count_tokens
 
 
 class TestStage1Optimizer:
@@ -35,11 +36,11 @@ class TestStage1Optimizer:
                 original="Product Marketing Manager skill for developing comprehensive "
                         "go-to-market strategies, product positioning, competitive analysis, "
                         "and launch planning for enterprise SaaS products.",
-                original_token_count=0
+                original_token_count=50  # Set >= 40 to avoid description regeneration
             ),
             body=Body(
                 original="# Marketing Strategy\n\nCore principles...",
-                original_token_count=0
+                original_token_count=10
             ),
             metadata=SkillMetadata(
                 category="marketing",
@@ -119,14 +120,14 @@ class TestStage1Optimizer:
 
         optimizer = Stage1Optimizer(llm_client=mock_client)
 
-        adversarial = [
+        distractors = [
             {"name": "content-marketing", "description": "Content creation skill"}
         ]
 
         result = optimizer.test_routing(
             compressed_description="Go-to-market strategy skill",
             target_skill=skill,
-            adversarial_skills=adversarial,
+            distractors=distractors,
             query="Help me create a go-to-market strategy"
         )
 
@@ -149,14 +150,14 @@ class TestStage1Optimizer:
 
         optimizer = Stage1Optimizer(llm_client=mock_client)
 
-        adversarial = [
+        distractors = [
             {"name": "content-marketing", "description": "Content creation skill"}
         ]
 
         result = optimizer.test_routing(
             compressed_description="Marketing skill",  # Vague description
             target_skill=skill,
-            adversarial_skills=adversarial,
+            distractors=distractors,
             query="Help me with marketing"
         )
 
@@ -258,22 +259,13 @@ class TestStage1Optimizer:
                     {"clause_id": "5", "content": "launch planning"}
                 ]
             }),
-            # 2. Generate adversarial
+            # 2. Generate adversarial (for get_distractors)
             json.dumps({
                 "adversarial_skills": [
                     {"name": "content-marketing", "description": "Content marketing skill"}
                 ]
             }),
-            # 3. Generate query
-            json.dumps({
-                "query": "Help me develop a go-to-market strategy"
-            }),
-            # 4. Routing test (various calls during DDMIN)
-            json.dumps({
-                "selected_skill": "marketing-strategy-pmm",
-                "reasoning": "Matches the query"
-            }),
-            # 5. Rewrite
+            # 3. Rewrite
             json.dumps({
                 "description": "Product Marketing Manager skill for go-to-market strategies and product positioning."
             })
@@ -290,8 +282,18 @@ class TestStage1Optimizer:
 
         mock_client.client.chat.completions.create = mock_create
 
-        optimizer = Stage1Optimizer(llm_client=mock_client)
-        result = optimizer.compress_description(skill, use_oracle_validation=False)
+        # Patch TF-IDF index to return empty list (no real distractors)
+        # Also patch count_tokens to return >= 40 so ensure_description skips generation
+        with patch.object(Stage1Optimizer, '__init__', lambda self, llm_client, oracle_model=None, skill_library_path=None: None):
+            optimizer = Stage1Optimizer.__new__(Stage1Optimizer)
+            optimizer.llm_client = mock_client
+            optimizer.oracle_model = mock_client.model
+            optimizer.tfidf_index = Mock()
+            optimizer.tfidf_index.get_real_distractors = Mock(return_value=[])
+
+            # Patch count_tokens to return high values so ensure_description skips generation
+            with patch('src.stage1_router.count_tokens', side_effect=lambda text: 50 if text and len(text) > 20 else 0):
+                result = optimizer.compress_description(skill, use_oracle_validation=False, enable_phase2=False)
 
         assert isinstance(result, CompressionResult)
         assert result.original_description == skill.description.original
@@ -328,8 +330,6 @@ class TestStage1Optimizer:
                 ]
             }),
             json.dumps({"adversarial_skills": []}),
-            json.dumps({"query": "Test query"}),
-            json.dumps({"selected_skill": "marketing-strategy-pmm", "reasoning": "test"}),
             json.dumps({"description": "Marketing strategy skill for go-to-market planning."})
         ]
 
@@ -344,8 +344,16 @@ class TestStage1Optimizer:
 
         mock_client.client.chat.completions.create = mock_create
 
-        optimizer = Stage1Optimizer(llm_client=mock_client)
-        updated_skill = optimizer.compress_skill(skill, use_oracle_validation=False)
+        # Create optimizer with mocked TF-IDF
+        optimizer = Stage1Optimizer.__new__(Stage1Optimizer)
+        optimizer.llm_client = mock_client
+        optimizer.oracle_model = mock_client.model
+        optimizer.tfidf_index = Mock()
+        optimizer.tfidf_index.get_real_distractors = Mock(return_value=[])
+
+        # Patch count_tokens to return high values so ensure_description skips generation
+        with patch('src.stage1_router.count_tokens', side_effect=lambda text: 50 if text and len(text) > 20 else 0):
+            updated_skill = optimizer.compress_skill(skill, use_oracle_validation=False, enable_phase2=False)
 
         assert updated_skill.description.compressed is not None
         assert updated_skill.description.compressed_token_count > 0
