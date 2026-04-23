@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from .models import Skill, ContentBlock, ContentType, Description, Body, References, OnDemandModules
 from .stage1_router import Stage1Optimizer
 from .optimizer import Stage2Optimizer, CompressionMetrics
+from .chunker import count_tokens
 
 
 def _is_content_type(block: ContentBlock, content_type: ContentType) -> bool:
@@ -302,8 +303,8 @@ Identify all core operational concepts in the original and check if they are pre
         """
         Perform fine-grained rollback by content type.
 
-        Only rolls back blocks of the specified types, keeping successful
-        compressions for other types.
+        Uses set concatenation logic: keep compressed blocks NOT in rollback_types,
+        add original blocks that ARE in rollback_types.
 
         Args:
             compressed_blocks: The compressed blocks.
@@ -316,32 +317,27 @@ Identify all core operational concepts in the original and check if they are pre
         if not rollback_types:
             return compressed_blocks
 
-        rollback_type_values = set(rollback_types)
+        rollback_type_set = set(rollback_types)
+
+        # Set concatenation: keep non-rollback compressed + add rollback originals
         result_blocks = []
 
+        # Add compressed blocks that are NOT in rollback_types
         for block in compressed_blocks:
             block_type = block.content_type if isinstance(block.content_type, str) else block.content_type.value
-
-            if block_type in rollback_type_values:
-                # Find original block of same type and similar content
-                original_match = None
-                for orig_block in original_blocks:
-                    orig_type = orig_block.content_type if isinstance(orig_block.content_type, str) else orig_block.content_type.value
-                    if orig_type == block_type:
-                        original_match = orig_block
-                        break
-
-                if original_match:
-                    result_blocks.append(ContentBlock(
-                        chunk_id=original_match.chunk_id,
-                        content=original_match.content,
-                        content_type=original_match.content_type,
-                        token_count=original_match.token_count
-                    ))
-                else:
-                    result_blocks.append(block)
-            else:
+            if block_type not in rollback_type_set:
                 result_blocks.append(block)
+
+        # Add original blocks that ARE in rollback_types
+        for block in original_blocks:
+            block_type = block.content_type if isinstance(block.content_type, str) else block.content_type.value
+            if block_type in rollback_type_set:
+                result_blocks.append(ContentBlock(
+                    chunk_id=block.chunk_id,
+                    content=block.content,
+                    content_type=block.content_type,
+                    token_count=block.token_count
+                ))
 
         return result_blocks
 
@@ -887,7 +883,7 @@ class CompressionPipeline:
             # ============================================================
             # Gate 1: Faithfulness Verification (Fine-grained Rollback)
             # ============================================================
-            if self.enable_gate1 and stage2_compressed and final_blocks:
+            if self.enable_gate1 and stage2_compressed:
                 faithfulness_result = self.quality_gates.run_faithfulness_gate(
                     skill, final_blocks
                 )
@@ -897,13 +893,101 @@ class CompressionPipeline:
                     rollback_performed = True
                     rollback_types = faithfulness_result.rollback_types
 
-                    # Fine-grained rollback: only rollback specific types
-                    final_blocks = self.quality_gates.fine_grained_rollback(
-                        compressed_blocks=final_blocks,
-                        original_blocks=original_blocks,
-                        rollback_types=rollback_types
-                    )
-                    on_demand_modules = OnDemandModules()
+                    # Fine-grained rollback by content type
+                    rollback_type_set = set(rollback_types)
+
+                    # 1. Rollback core_rule: replace final_blocks with original's core_rule
+                    if "core_rule" in rollback_type_set:
+                        original_core_blocks = [
+                            b for b in original_blocks
+                            if (b.content_type if isinstance(b.content_type, str) else b.content_type.value) == "core_rule"
+                        ]
+                        # Keep non-core_rule compressed blocks, add original core_rule blocks
+                        non_core_compressed = [
+                            b for b in final_blocks
+                            if (b.content_type if isinstance(b.content_type, str) else b.content_type.value) != "core_rule"
+                        ]
+                        final_blocks = non_core_compressed + [
+                            ContentBlock(
+                                chunk_id=b.chunk_id,
+                                content=b.content,
+                                content_type=b.content_type,
+                                token_count=b.token_count
+                            ) for b in original_core_blocks
+                        ]
+
+                    # 2. Rollback on-demand modules: examples, templates, backgrounds
+                    # Each type is rolled back independently
+                    if on_demand_modules is None:
+                        on_demand_modules = OnDemandModules()
+
+                    # Rollback examples
+                    if "example" in rollback_type_set:
+                        original_examples = [
+                            b for b in original_blocks
+                            if (b.content_type if isinstance(b.content_type, str) else b.content_type.value) == "example"
+                        ]
+                        on_demand_modules.examples = [
+                            ContentBlock(
+                                chunk_id=b.chunk_id,
+                                content=b.content,
+                                content_type=b.content_type,
+                                token_count=b.token_count
+                            ) for b in original_examples
+                        ]
+
+                    # Rollback templates
+                    if "template" in rollback_type_set:
+                        original_templates = [
+                            b for b in original_blocks
+                            if (b.content_type if isinstance(b.content_type, str) else b.content_type.value) == "template"
+                        ]
+                        on_demand_modules.templates = [
+                            ContentBlock(
+                                chunk_id=b.chunk_id,
+                                content=b.content,
+                                content_type=b.content_type,
+                                token_count=b.token_count
+                            ) for b in original_templates
+                        ]
+
+                    # Rollback backgrounds
+                    if "background" in rollback_type_set:
+                        original_backgrounds = [
+                            b for b in original_blocks
+                            if (b.content_type if isinstance(b.content_type, str) else b.content_type.value) == "background"
+                        ]
+                        on_demand_modules.backgrounds = [
+                            ContentBlock(
+                                chunk_id=b.chunk_id,
+                                content=b.content,
+                                content_type=b.content_type,
+                                token_count=b.token_count
+                            ) for b in original_backgrounds
+                        ]
+
+                    # 3. Regenerate routing metadata and update references for rolled-back modules
+                    types_need_routing_update = [t for t in rollback_types if t in ("example", "template", "background")]
+                    if types_need_routing_update and on_demand_modules:
+                        routing_metadata = self.stage2_optimizer.generate_all_routing_metadata(
+                            on_demand_modules=on_demand_modules,
+                            skill_name=skill.name,
+                            skill_description=skill.description.original
+                        )
+                        # Update reference files with rolled-back on-demand modules
+                        on_demand_files = on_demand_modules.to_reference_files(routing_metadata)
+                        # Remove old on-demand files from references, add new ones
+                        existing_non_on_demand = {
+                            k: v for k, v in updated_references.files.items()
+                            if not k.startswith("on-demand-")
+                        }
+                        all_reference_files = {**existing_non_on_demand, **on_demand_files}
+                        updated_references = References(
+                            files=all_reference_files,
+                            total_token_count=sum(
+                                count_tokens(c) for c in all_reference_files.values()
+                            )
+                        )
 
                     errors.append(
                         f"Gate 1 failed - missing concepts: {faithfulness_result.missing_concepts}, rolled back types: {rollback_types}"
