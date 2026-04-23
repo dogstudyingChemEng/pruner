@@ -12,7 +12,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
-from .models import Skill, ContentBlock, ContentType, Description, Body, References
+from .models import Skill, ContentBlock, ContentType, Description, Body, References, OnDemandModules
 from .stage1_router import Stage1Optimizer
 from .optimizer import Stage2Optimizer, CompressionMetrics
 
@@ -490,8 +490,10 @@ class CompressionPipeline:
             # ============================================================
             # Stage 2: Body Classification and Compression
             # ============================================================
+            on_demand_modules = None
             try:
-                final_blocks, updated_references, compression_metrics = self.stage2_optimizer.optimize_skill(
+                # New return structure: (core_blocks, on_demand_modules, references, metrics)
+                core_blocks, on_demand_modules, updated_references, compression_metrics = self.stage2_optimizer.optimize_skill(
                     skill,
                     compress_core=compress_core,
                     dedup_examples=dedup_examples,
@@ -499,11 +501,14 @@ class CompressionPipeline:
                     summarize_background=summarize_background,
                     dedup_references=dedup_references
                 )
+                final_blocks = core_blocks  # Only core blocks go into body
                 stage2_compressed = True
             except Exception as e:
                 errors.append(f"Stage 2 failed: {str(e)}")
                 # Use original blocks as fallback
                 final_blocks = self.stage2_optimizer.classify_skill_body(skill)
+                on_demand_modules = OnDemandModules()
+                updated_references = skill.references
 
             # ============================================================
             # Gate 1: Faithfulness Verification
@@ -519,6 +524,7 @@ class CompressionPipeline:
 
                     # Rollback: re-classify without compression
                     final_blocks = self.stage2_optimizer.classify_skill_body(skill)
+                    on_demand_modules = OnDemandModules()
 
                     errors.append(
                         f"Gate 1 failed - missing concepts: {faithfulness_result.missing_concepts}"

@@ -131,6 +131,74 @@ class Body(BaseModel):
         return [b for b in self.content_blocks if b.content_type == content_type]
 
 
+class OnDemandModules(BaseModel):
+    """
+    On-demand modules for progressive disclosure.
+
+    Based on SkillReducer paper, these modules are NOT loaded into the main context
+    by default. They are saved as separate reference files and only loaded when needed.
+
+    Three types of on-demand modules:
+    - examples: Code snippets and usage examples
+    - templates: Ready-to-use templates and boilerplate
+    - background: Explanations and contextual knowledge
+    """
+
+    examples: list[ContentBlock] = Field(
+        default_factory=list,
+        description="Example blocks - loaded on demand"
+    )
+    templates: list[ContentBlock] = Field(
+        default_factory=list,
+        description="Template blocks - loaded on demand"
+    )
+    background: list[ContentBlock] = Field(
+        default_factory=list,
+        description="Background blocks - loaded on demand"
+    )
+
+    @property
+    def total_tokens(self) -> int:
+        """Total tokens across all on-demand modules."""
+        return (
+            sum(b.token_count for b in self.examples) +
+            sum(b.token_count for b in self.templates) +
+            sum(b.token_count for b in self.background)
+        )
+
+    def to_reference_files(self) -> dict[str, str]:
+        """
+        Convert on-demand modules to reference file format.
+
+        Returns:
+            Dictionary mapping filename to content for each non-empty module.
+        """
+        files = {}
+
+        if self.examples:
+            content = "\n\n---\n\n".join([
+                f"## Example {i+1}\n\n{b.content}"
+                for i, b in enumerate(self.examples)
+            ])
+            files["on-demand-examples.md"] = content
+
+        if self.templates:
+            content = "\n\n---\n\n".join([
+                f"## Template {i+1}\n\n{b.content}"
+                for i, b in enumerate(self.templates)
+            ])
+            files["on-demand-templates.md"] = content
+
+        if self.background:
+            content = "\n\n---\n\n".join([
+                f"## Background {i+1}\n\n{b.content}"
+                for i, b in enumerate(self.background)
+            ])
+            files["on-demand-background.md"] = content
+
+        return files
+
+
 class References(BaseModel):
     """
     Skill references (s.R) - optional files loaded alongside body.

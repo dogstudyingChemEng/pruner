@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from .chunker import chunk_markdown_body, count_tokens
 from .llm_client import BlockClassificationResult, SkillLLMClient
-from .models import ContentBlock, ContentType, Skill, References
+from .models import ContentBlock, ContentType, Skill, References, OnDemandModules
 
 
 def _is_content_type(block: ContentBlock, content_type: ContentType) -> bool:
@@ -31,9 +31,9 @@ class CompressionMetrics:
 
     original_tokens: int
     compressed_tokens: int
-    always_loaded_tokens: int
-    on_demand_tokens: int
-    discarded_tokens: int
+    always_loaded_tokens: int  # Core rules - always in context
+    on_demand_tokens: int  # Examples/Templates/Background - saved as references
+    discarded_tokens: int  # Redundant - thrown away
     compression_ratio: float
     core_compression_ratio: float
     examples_deduped: int
@@ -41,6 +41,10 @@ class CompressionMetrics:
     background_summarized: int
     references_deduped: int
     references_discarded: int
+    # New fields for progressive disclosure
+    on_demand_examples_tokens: int = 0
+    on_demand_templates_tokens: int = 0
+    on_demand_background_tokens: int = 0
 
 
 class Stage2Optimizer:
@@ -639,17 +643,24 @@ Keep only unique, additional information."""
         dedup_templates: bool = True,
         summarize_background: bool = True,
         dedup_references: bool = True
-    ) -> tuple[list[ContentBlock], References, CompressionMetrics]:
+    ) -> tuple[list[ContentBlock], OnDemandModules, References, CompressionMetrics]:
         """
-        Full Stage 2 optimization pipeline.
+        Full Stage 2 optimization pipeline with Progressive Disclosure.
+
+        This method implements the Progressive Disclosure architecture from the SkillReducer paper:
+        - Core rules (core_rule): Stay in main body - ALWAYS loaded
+        - Examples (example): Saved as on-demand module - loaded when needed
+        - Templates (template): Saved as on-demand module - loaded when needed
+        - Background (background): Saved as on-demand module - loaded when needed
+        - Redundant (redundant): DISCARDED - thrown away
 
         Steps:
         1. Classify body content into taxonomy types
-        2. Compress core rules
-        3. Deduplicate examples
-        4. Deduplicate templates
-        5. Summarize background
-        6. Cross-file deduplication with references
+        2. Compress core rules (stays in body)
+        3. Deduplicate examples (saved as on-demand)
+        4. Deduplicate templates (saved as on-demand)
+        5. Summarize background (saved as on-demand)
+        6. Cross-file deduplication with existing references
 
         Args:
             skill: The skill to optimize.
@@ -660,7 +671,11 @@ Keep only unique, additional information."""
             dedup_references: Whether to deduplicate references.
 
         Returns:
-            Tuple of (optimized blocks, updated references, compression metrics).
+            Tuple of:
+            - core_blocks: Content blocks for main body (ONLY core_rule type)
+            - on_demand_modules: OnDemandModules containing examples/templates/background
+            - updated_references: Updated References (existing refs + on-demand refs)
+            - compression_metrics: CompressionMetrics with detailed stats
         """
         import tiktoken
         encoding = tiktoken.get_encoding("cl100k_base")
@@ -690,7 +705,7 @@ Keep only unique, additional information."""
         background_blocks = [b for b in blocks if _is_content_type(b, ContentType.BACKGROUND)]
         redundant_blocks = [b for b in blocks if _is_content_type(b, ContentType.REDUNDANT)]
 
-        # Step 2: Compress core rules
+        # Step 2: Compress core rules (STAYS IN BODY)
         if compress_core and core_blocks:
             original_core_tokens = sum(b.token_count for b in core_blocks)
             core_blocks = self.compress_core_rules(core_blocks)
@@ -698,36 +713,48 @@ Keep only unique, additional information."""
             if original_core_tokens > 0:
                 core_compression_ratio = 1.0 - (new_core_tokens / original_core_tokens)
 
-        # Step 3: Deduplicate examples
+        # Step 3: Deduplicate examples (SAVED AS ON-DEMAND MODULE)
         if dedup_examples and example_blocks:
             example_blocks, examples_removed = self.dedup_examples(example_blocks)
 
-        # Step 4: Deduplicate templates
+        # Step 4: Deduplicate templates (SAVED AS ON-DEMAND MODULE)
         if dedup_templates and template_blocks:
             template_blocks, templates_removed = self.dedup_templates(template_blocks)
 
-        # Step 5: Summarize background
+        # Step 5: Summarize background (SAVED AS ON-DEMAND MODULE)
         if summarize_background and background_blocks:
             background_blocks, background_merged = self.summarize_background(background_blocks)
 
-        # Combine all processed blocks
-        processed_blocks = core_blocks + example_blocks + template_blocks + background_blocks
+        # Create OnDemandModules for progressive disclosure
+        on_demand_modules = OnDemandModules(
+            examples=example_blocks,
+            templates=template_blocks,
+            background=background_blocks
+        )
 
-        # Step 6: Cross-file deduplication
+        # Step 6: Cross-file deduplication with existing references
+        # Note: We dedupe against CORE RULES only, not on-demand modules
         updated_references = skill.references
         if dedup_references and skill.references.files:
             updated_references, ref_blocks_deduped, ref_files_discarded = self.dedup_references(
-                processed_blocks, skill.references
+                core_blocks, skill.references  # Only core blocks for dedup
             )
+
+        # Add on-demand modules to references
+        on_demand_files = on_demand_modules.to_reference_files()
+        all_reference_files = {**updated_references.files, **on_demand_files}
 
         # Calculate final metrics
         always_loaded_tokens = sum(b.token_count for b in core_blocks)
-        on_demand_tokens = sum(
-            b.token_count for b in example_blocks + template_blocks + background_blocks
-        )
+        on_demand_examples_tokens = sum(b.token_count for b in example_blocks)
+        on_demand_templates_tokens = sum(b.token_count for b in template_blocks)
+        on_demand_background_tokens = sum(b.token_count for b in background_blocks)
+        on_demand_tokens = on_demand_examples_tokens + on_demand_templates_tokens + on_demand_background_tokens
         discarded_tokens = sum(b.token_count for b in redundant_blocks)
 
-        total_compressed_tokens = always_loaded_tokens + on_demand_tokens + updated_references.total_token_count
+        # Total tokens in output (core + on-demand + references)
+        total_reference_tokens = sum(count_tokens(c) for c in all_reference_files.values())
+        total_compressed_tokens = always_loaded_tokens + total_reference_tokens
 
         compression_ratio = 0.0
         if total_original_tokens > 0:
@@ -745,10 +772,20 @@ Keep only unique, additional information."""
             templates_deduped=templates_removed,
             background_summarized=background_merged,
             references_deduped=ref_blocks_deduped,
-            references_discarded=ref_files_discarded
+            references_discarded=ref_files_discarded,
+            on_demand_examples_tokens=on_demand_examples_tokens,
+            on_demand_templates_tokens=on_demand_templates_tokens,
+            on_demand_background_tokens=on_demand_background_tokens
         )
 
-        return processed_blocks, updated_references, metrics
+        # Create final references with both original and on-demand files
+        final_references = References(
+            files=all_reference_files,
+            total_token_count=total_reference_tokens
+        )
+
+        # Return ONLY core blocks for body, on-demand modules separately
+        return core_blocks, on_demand_modules, final_references, metrics
 
     # ============================================================
     # Utility Methods

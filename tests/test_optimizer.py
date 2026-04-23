@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.llm_client import BlockClassification, BlockClassificationResult
-from src.models import ContentBlock, ContentType, Skill, Description, Body, References, SkillMetadata
+from src.models import ContentBlock, ContentType, Skill, Description, Body, References, SkillMetadata, OnDemandModules
 from src.optimizer import Stage2Optimizer, CompressionMetrics
 from src.parser import parse_skill_file
 
@@ -750,12 +750,13 @@ class TestFullOptimizationPipeline:
             metadata=SkillMetadata()
         )
 
-        blocks, refs, metrics = optimizer.optimize_skill(skill)
+        core_blocks, on_demand, refs, metrics = optimizer.optimize_skill(skill)
 
         assert isinstance(metrics, CompressionMetrics)
         assert metrics.original_tokens > 0
         assert metrics.compressed_tokens > 0
         assert isinstance(metrics.compression_ratio, float)
+        assert isinstance(on_demand, OnDemandModules)
 
     def test_optimize_skill_skip_steps(self):
         """Test optimization with some steps disabled."""
@@ -778,7 +779,7 @@ class TestFullOptimizationPipeline:
         )
 
         # Skip all compression steps
-        blocks, refs, metrics = optimizer.optimize_skill(
+        core_blocks, on_demand, refs, metrics = optimizer.optimize_skill(
             skill,
             compress_core=False,
             dedup_examples=False,
@@ -788,5 +789,6 @@ class TestFullOptimizationPipeline:
         )
 
         # Should still classify but not compress
-        assert len(blocks) >= 0
+        assert len(core_blocks) >= 0
         assert isinstance(metrics, CompressionMetrics)
+        assert isinstance(on_demand, OnDemandModules)
