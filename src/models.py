@@ -83,6 +83,10 @@ class Description(BaseModel):
         default=0,
         description="Token count of compressed description"
     )
+    structured: Optional["StructuredDescription"] = Field(
+        default=None,
+        description="Structured routing signals per paper methodology"
+    )
 
     @property
     def compression_ratio(self) -> float:
@@ -90,6 +94,140 @@ class Description(BaseModel):
         if self.original_token_count == 0:
             return 0.0
         return 1.0 - (self.compressed_token_count / self.original_token_count)
+
+    def to_legacy_format(self) -> str:
+        """Convert structured description to legacy free-form format."""
+        if self.structured:
+            return self.structured.combined_description
+        return self.original
+
+
+class EvaluationCondition(str, Enum):
+    """
+    Three conditions for Gate 2 evaluation per SkillReducer paper.
+
+    - D (Default): No skill - baseline for agent's inherent capability
+    - A (Auto): Original skill - establishes upper bound for expected performance
+    - C (Compressed): Compressed skill with read_file - tests progressive disclosure
+    """
+
+    D = "D"  # No skill - baseline
+    A = "A"  # Original skill
+    C = "C"  # Compressed with read_file
+
+
+class RoutingSignal(BaseModel):
+    """
+    Single routing signal component per SkillReducer paper.
+
+    Each signal is 20-40 tokens and represents a distinct routing signal:
+    - primary_capability: What the skill does
+    - trigger_condition: When to invoke the skill
+    - unique_identifier: Libraries, APIs, frameworks referenced
+    """
+
+    signal_type: str = Field(
+        description="Type: primary_capability, trigger_condition, unique_identifier"
+    )
+    content: str = Field(description="Signal content text")
+    token_count: int = Field(default=0, description="Token count of signal")
+
+
+class StructuredDescription(BaseModel):
+    """
+    Description with structured routing signals per SkillReducer paper.
+
+    Per paper methodology, description generation produces three routing signals
+    each 20-40 tokens:
+    - primary_capability: What the skill does
+    - trigger_condition: When to invoke
+    - unique_identifiers: Distinguishing features (libraries, APIs, etc.)
+    """
+
+    primary_capability: RoutingSignal = Field(
+        description="What the skill does (20-40 tokens)"
+    )
+    trigger_condition: RoutingSignal = Field(
+        description="When to use the skill (20-40 tokens)"
+    )
+    unique_identifiers: list[RoutingSignal] = Field(
+        default_factory=list,
+        description="Distinguishing features (20-40 tokens each, max 3)"
+    )
+    combined_description: str = Field(
+        default="",
+        description="Combined free-form description for backward compatibility"
+    )
+    total_tokens: int = Field(default=0, description="Total token count")
+
+
+class ConditionScore(BaseModel):
+    """
+    Score for single evaluation condition in Gate 2.
+
+    Per paper, scores are calculated via hybrid evaluation:
+    - pytest_score: Code execution score (52.3% weight)
+    - llm_judge_score: Rubric evaluation score (47.7% weight)
+    """
+
+    condition: EvaluationCondition = Field(
+        description="Which condition was tested: D, A, or C"
+    )
+    pytest_score: float = Field(
+        default=0.0,
+        description="Code execution score (0.0-1.0)"
+    )
+    llm_judge_score: float = Field(
+        default=0.0,
+        description="LLM rubric evaluation score (0.0-1.0)"
+    )
+    weighted_score: float = Field(
+        default=0.0,
+        description="Combined weighted score (pytest * 0.523 + judge * 0.477)"
+    )
+    task_id: str = Field(description="Task identifier")
+    loaded_references: list[str] = Field(
+        default_factory=list,
+        description="References loaded for Condition C via read_file"
+    )
+    details: dict = Field(
+        default_factory=dict,
+        description="Additional evaluation details"
+    )
+
+
+class RetentionResult(BaseModel):
+    """
+    Retention calculation result per SkillReducer paper.
+
+    Retention = score_C / score_A
+    Passed if retention >= threshold (default 0.86)
+    """
+
+    score_D: float = Field(
+        default=0.0,
+        description="Baseline score (no skill)"
+    )
+    score_A: float = Field(
+        default=0.0,
+        description="Original skill score"
+    )
+    score_C: float = Field(
+        default=0.0,
+        description="Compressed skill score"
+    )
+    retention: float = Field(
+        default=0.0,
+        description="score_C / score_A ratio"
+    )
+    passed: bool = Field(
+        default=False,
+        description="Whether retention meets threshold"
+    )
+    improvement_over_baseline: float = Field(
+        default=0.0,
+        description="(score_A - score_D) / score_D improvement"
+    )
 
 
 class Body(BaseModel):
@@ -333,3 +471,7 @@ class Skill(BaseModel):
         if self.total_original_tokens == 0:
             return 0.0
         return 1.0 - (self.total_compressed_tokens / self.total_original_tokens)
+
+
+# Resolve forward references
+Description.model_rebuild()

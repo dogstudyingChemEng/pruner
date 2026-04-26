@@ -9,6 +9,7 @@ Key improvements aligned with paper:
 - Phase 2: Real-world validation with selective restore
 - TF-IDF based real distractors + 1 LLM-generated adversarial skill
 - Pre-generation for missing/short descriptions
+- Structured routing signals (primary capability, trigger condition, unique identifiers)
 """
 
 import json
@@ -22,7 +23,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from .models import Skill
+from .models import Skill, StructuredDescription, RoutingSignal
 from .llm_client import SkillLLMClient
 from .chunker import count_tokens
 
@@ -246,7 +247,12 @@ class Stage1Optimizer:
     # Pre-generation for missing/short descriptions
     # ============================================================
 
-    def ensure_description(self, skill: Skill, min_tokens: int = 40) -> Skill:
+    def ensure_description(
+        self,
+        skill: Skill,
+        min_tokens: int = 40,
+        enable_structured: bool = False
+    ) -> Skill:
         """
         Ensure skill has a valid description with minimum tokens.
 
@@ -255,6 +261,7 @@ class Stage1Optimizer:
         Args:
             skill: The skill to check/update.
             min_tokens: Minimum token count required.
+            enable_structured: Generate structured routing signals per paper methodology.
 
         Returns:
             Updated Skill with valid description.
@@ -266,11 +273,17 @@ class Stage1Optimizer:
             return skill
 
         # Generate description from body
-        generated_desc = self._generate_description_from_body(skill)
-
-        if generated_desc:
-            skill.description.original = generated_desc
-            skill.description.original_token_count = count_tokens(generated_desc)
+        if enable_structured:
+            structured_desc = self.generate_structured_description(skill)
+            if structured_desc:
+                skill.description.structured = structured_desc
+                skill.description.original = structured_desc.combined_description
+                skill.description.original_token_count = structured_desc.total_tokens
+        else:
+            generated_desc = self._generate_description_from_body(skill)
+            if generated_desc:
+                skill.description.original = generated_desc
+                skill.description.original_token_count = count_tokens(generated_desc)
 
         return skill
 
@@ -317,6 +330,180 @@ Generate a concise description for routing purposes."""
         result_dict = json.loads(response_text)
 
         return result_dict.get("description")
+
+    def generate_structured_description(
+        self,
+        skill: Skill
+    ) -> Optional[StructuredDescription]:
+        """
+        Generate structured routing signals per SkillReducer paper.
+
+        Per paper methodology, description generation produces three routing signals,
+        each 20-40 tokens:
+        - primary_capability: What the skill does
+        - trigger_condition: When to invoke the skill
+        - unique_identifiers: Libraries, APIs, frameworks referenced (max 3)
+
+        Args:
+            skill: The skill to generate description for.
+
+        Returns:
+            StructuredDescription with three routing signals.
+        """
+        if not skill.body.original or not skill.body.original.strip():
+            return None
+
+        system_prompt = """You are an expert at extracting routing signals from skill documentation.
+
+Your task is to identify THREE distinct routing signals from the skill body, each signal
+should be 20-40 tokens:
+
+1. PRIMARY CAPABILITY: What does this skill do? Focus on the main function/purpose.
+2. TRIGGER CONDITION: When should this skill be invoked? What scenarios require it?
+3. UNIQUE IDENTIFIERS: What specific libraries, APIs, frameworks, or tools does this skill
+   reference? These help distinguish it from similar skills.
+
+Guidelines:
+- Each signal should be concise but informative (20-40 tokens)
+- Be specific - use actual names of tools/libraries when mentioned
+- Avoid generic phrases like "helps with..." or "provides..."
+- Focus on distinguishing features that help routing
+
+IMPORTANT: Respond with a JSON object:
+{
+  "primary_capability": {
+    "content": "What the skill does (20-40 tokens)",
+    "token_count": 25
+  },
+  "trigger_condition": {
+    "content": "When to invoke the skill (20-40 tokens)",
+    "token_count": 30
+  },
+  "unique_identifiers": [
+    {
+      "signal_type": "unique_identifier",
+      "content": "Library/API/framework name with context (20-40 tokens)",
+      "token_count": 20
+    }
+  ],
+  "combined_description": "Natural language description combining all signals"
+}"""
+
+        user_prompt = f"""Skill Name: {skill.name}
+Category: {skill.metadata.category or 'general'}
+Tags: {', '.join(skill.metadata.tags) if skill.metadata.tags else 'none'}
+
+Skill Body Content (first 3000 chars):
+{skill.body.original[:3000]}
+
+Extract THREE routing signals: primary capability, trigger condition, and unique identifiers."""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+
+        response_text = response.choices[0].message.content
+        result_dict = json.loads(response_text)
+
+        try:
+            # Build RoutingSignal objects
+            primary_cap = RoutingSignal(
+                signal_type="primary_capability",
+                content=result_dict.get("primary_capability", {}).get("content", ""),
+                token_count=result_dict.get("primary_capability", {}).get("token_count", 0)
+            )
+
+            trigger_cond = RoutingSignal(
+                signal_type="trigger_condition",
+                content=result_dict.get("trigger_condition", {}).get("content", ""),
+                token_count=result_dict.get("trigger_condition", {}).get("token_count", 0)
+            )
+
+            unique_ids = []
+            for uid in result_dict.get("unique_identifiers", [])[:3]:
+                unique_ids.append(RoutingSignal(
+                    signal_type="unique_identifier",
+                    content=uid.get("content", ""),
+                    token_count=uid.get("token_count", 0)
+                ))
+
+            combined = result_dict.get("combined_description", "")
+            if not combined:
+                # Combine signals if combined_description not provided
+                combined = f"{primary_cap.content}. {trigger_cond.content}."
+                if unique_ids:
+                    combined += f" Uses: {', '.join([u.content for u in unique_ids])}."
+
+            total_tokens = primary_cap.token_count + trigger_cond.token_count + sum(u.token_count for u in unique_ids)
+
+            return StructuredDescription(
+                primary_capability=primary_cap,
+                trigger_condition=trigger_cond,
+                unique_identifiers=unique_ids,
+                combined_description=combined,
+                total_tokens=total_tokens
+            )
+
+        except Exception:
+            # Fallback to unstructured description
+            fallback_desc = result_dict.get("description", result_dict.get("combined_description", ""))
+            if fallback_desc:
+                return StructuredDescription(
+                    primary_capability=RoutingSignal(
+                        signal_type="primary_capability",
+                        content=fallback_desc,
+                        token_count=40
+                    ),
+                    trigger_condition=RoutingSignal(
+                        signal_type="trigger_condition",
+                        content="",
+                        token_count=0
+                    ),
+                    unique_identifiers=[],
+                    combined_description=fallback_desc,
+                    total_tokens=40
+                )
+            return None
+
+    def validate_routing_signals(
+        self,
+        structured_desc: StructuredDescription
+    ) -> bool:
+        """
+        Validate routing signals meet token requirements.
+
+        Per paper, each signal should be 20-40 tokens.
+
+        Args:
+            structured_desc: Structured description to validate.
+
+        Returns:
+            True if signals meet requirements.
+        """
+        # Check primary capability (required, 20-40 tokens)
+        primary_tokens = structured_desc.primary_capability.token_count
+        if primary_tokens < 20 or primary_tokens > 40:
+            # Allow some flexibility
+            if primary_tokens < 10:
+                return False
+
+        # Check trigger condition (20-40 tokens)
+        trigger_tokens = structured_desc.trigger_condition.token_count
+        if trigger_tokens > 0 and (trigger_tokens < 10 or trigger_tokens > 50):
+            return False
+
+        # Unique identifiers optional but should be reasonable if present
+        for uid in structured_desc.unique_identifiers:
+            if uid.token_count > 50:
+                return False
+
+        return True
 
     def segment_description(
         self,
@@ -488,7 +675,8 @@ Generate {num_candidates} adversarial skills that could be confused with this ta
         compressed_description: str,
         target_skill: Skill,
         distractors: list[dict],
-        query: Optional[str] = None
+        query: Optional[str] = None,
+        randomize_order: bool = True
     ) -> RoutingTestResult:
         """
         Simulated Oracle O_sim: Test if compressed description routes correctly.
@@ -496,15 +684,22 @@ Generate {num_candidates} adversarial skills that could be confused with this ta
         Given a compressed description, target skill, and distractor skills,
         tests whether the LLM can correctly route to the target skill.
 
+        Per SkillReducer paper Section IV-A: "the order of candidates in C is
+        randomized for each query" to ensure selection is based on semantic merit
+        rather than positional bias.
+
         Args:
             compressed_description: The compressed description to test.
             target_skill: The target skill that should be selected.
             distractors: List of distractor skills (real + adversarial).
             query: Optional query that triggered the routing (generated if not provided).
+            randomize_order: Whether to randomize candidate order (default True per paper).
 
         Returns:
             RoutingTestResult indicating success or failure.
         """
+        import random
+
         # Generate a query if not provided
         if query is None:
             query = self._generate_routing_query(target_skill)
@@ -524,7 +719,7 @@ IMPORTANT: You must respond with a JSON object in the following format:
   "reasoning": "Brief explanation of why this skill was selected"
 }"""
 
-        # Build skill list
+        # Build skill list with target and distractors
         skills_list = []
         skills_list.append({
             "name": target_skill.name,
@@ -535,6 +730,10 @@ IMPORTANT: You must respond with a JSON object in the following format:
                 "name": adv["name"],
                 "description": adv["description"]
             })
+
+        # Per paper: randomize order to avoid positional bias
+        if randomize_order:
+            random.shuffle(skills_list)
 
         # Format skills for prompt
         skills_text = "\n\n".join([
@@ -674,7 +873,8 @@ Generate a realistic user query that would need this skill."""
         original_clauses: list[SemanticClause],
         skill: Skill,
         distractors: list[dict],
-        num_queries: int = 5
+        num_queries: int = 5,
+        max_restore_steps: int = 3
     ) -> tuple[list[SemanticClause], bool]:
         """
         Phase 2: Real-world validation with selective restore.
@@ -682,12 +882,15 @@ Generate a realistic user query that would need this skill."""
         Tests the minimal clauses with multiple diverse queries.
         If routing fails, selectively restores clauses that address the failure.
 
+        Per SkillReducer paper Algorithm 1 (lines 12-18): maximum of three restore steps.
+
         Args:
             minimal_clauses: The 1-minimal clause subset from Phase 1.
             original_clauses: All original clauses before reduction.
             skill: The target skill.
             distractors: Distractor skills for routing test.
             num_queries: Number of diverse test queries to use.
+            max_restore_steps: Maximum restore iterations (default 3 per paper).
 
         Returns:
             Tuple of (final_clauses, all_tests_passed).
@@ -699,8 +902,13 @@ Generate a realistic user query that would need this skill."""
         queries = self._generate_diverse_queries(skill, num_queries)
 
         all_passed = True
+        restore_count = 0
 
         for query in queries:
+            # Stop if max restore steps reached per paper
+            if restore_count >= max_restore_steps:
+                break
+
             temp_description = " ".join(c.content for c in current_clauses)
             result = self.test_routing(
                 compressed_description=temp_description,
@@ -725,6 +933,7 @@ Generate a realistic user query that would need this skill."""
                     # Remove restored from available removed_clauses
                     restored_ids = {c.clause_id for c in restored}
                     removed_clauses = [c for c in removed_clauses if c.clause_id not in restored_ids]
+                    restore_count += 1
 
         return current_clauses, all_passed
 

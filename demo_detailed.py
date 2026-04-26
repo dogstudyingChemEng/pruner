@@ -91,9 +91,9 @@ def main():
 
     print(f"LLM 配置:")
     print(f"  - Base URL: {base_url}")
-    print(f"  - Model: deepseek-chat")
+    print(f"  - Model: deepseek-v4-flash")
 
-    client = SkillLLMClient(api_key=api_key, base_url=base_url, model="deepseek-chat")
+    client = SkillLLMClient(api_key=api_key, base_url=base_url, model="deepseek-v4-flash")
     optimizer = Stage2Optimizer(llm_client=client, batch_size=10)
 
     print_subsection("分批调用 LLM")

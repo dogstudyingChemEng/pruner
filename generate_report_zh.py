@@ -23,7 +23,7 @@ def generate_report(skill_name: str = "marketing-strategy-pmm"):
     # Initialize
     api_key = os.getenv("OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_BASE_URL")
-    client = SkillLLMClient(api_key=api_key, base_url=base_url, model="deepseek-chat")
+    client = SkillLLMClient(api_key=api_key, base_url=base_url, model="deepseek-v4-flash")
     optimizer = Stage2Optimizer(llm_client=client, batch_size=10)
 
     # Parse skill

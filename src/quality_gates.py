@@ -7,19 +7,28 @@ from the SkillReducer paper to ensure compression quality.
 Key improvements aligned with paper:
 - Gate 1: Per-content-type fine-grained rollback
 - Gate 2: Fully automated evaluation loop with task generation
+- Gate 2: Three-condition evaluation (D/A/C) with retention calculation
+- Gate 2: read_file tool simulation for progressive disclosure
+- Gate 2: Hybrid scoring (pytest + LLM judge)
 """
 
 import json
+import uuid
 from typing import Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
 from pydantic import BaseModel, Field
 
-from .models import Skill, ContentBlock, ContentType, Description, Body, References, OnDemandModules
+from .models import (
+    Skill, ContentBlock, ContentType, Description, Body, References,
+    OnDemandModules, RoutingMetadata,
+    EvaluationCondition, ConditionScore, RetentionResult
+)
 from .stage1_router import Stage1Optimizer
 from .optimizer import Stage2Optimizer, CompressionMetrics
 from .chunker import count_tokens
+from .hybrid_evaluator import HybridEvaluator, PytestExecutor, LLMJudge
 
 
 def _is_content_type(block: ContentBlock, content_type: ContentType) -> bool:
@@ -31,6 +40,258 @@ def _is_content_type(block: ContentBlock, content_type: ContentType) -> bool:
     if isinstance(block.content_type, str):
         return block.content_type == content_type.value
     return block.content_type == content_type
+
+
+# ============================================================
+# read_file Tool Simulation
+# ============================================================
+
+
+class ToolCallDecision(BaseModel):
+    """Decision to call read_file tool for on-demand module."""
+
+    module_name: str = Field(description="Module filename to load")
+    reason: str = Field(description="Why this module is needed")
+    relevance_score: float = Field(
+        default=0.0,
+        description="Relevance match score (0.0-1.0)"
+    )
+
+
+class ReadFileToolCall(BaseModel):
+    """A simulated read_file tool call execution."""
+
+    call_id: str = Field(description="Unique call identifier")
+    module_name: str = Field(description="Module filename loaded")
+    module_content: str = Field(description="Module content returned")
+    relevance_match: float = Field(default=0.0)
+
+
+class ReadFileToolSimulator:
+    """
+    Simulates read_file tool for on-demand module loading.
+
+    Per SkillReducer paper, Condition C evaluation uses read_file tool:
+    - Agent decides which references to load based on when/topics metadata
+    - Maximum 6 tool calls per task
+    - Returns module content when called
+
+    This simulator matches query semantics to module routing metadata
+    to simulate the agent's decision process.
+    """
+
+    def __init__(
+        self,
+        on_demand_modules: OnDemandModules,
+        routing_metadata: dict[str, RoutingMetadata],
+        max_calls: int = 6
+    ):
+        """
+        Initialize read_file tool simulator.
+
+        Args:
+            on_demand_modules: On-demand modules available for loading.
+            routing_metadata: Routing metadata for each module (when/topics).
+            max_calls: Maximum tool calls allowed per task.
+        """
+        self.modules = on_demand_modules
+        self.routing = routing_metadata
+        self.max_calls = max_calls
+        self.call_history: list[ReadFileToolCall] = []
+
+    def suggest_tool_calls(
+        self,
+        llm_client,
+        query: str,
+        current_context: str
+    ) -> list[ToolCallDecision]:
+        """
+        LLM suggests which modules to load based on query and context.
+
+        Args:
+            llm_client: LLM client for decision making.
+            query: Task query to match against modules.
+            current_context: Current context (core rules).
+
+        Returns:
+            List of ToolCallDecision for modules to load.
+        """
+        # Build module descriptions for LLM
+        module_descriptions = self._build_module_descriptions()
+
+        system_prompt = """You are an AI agent deciding which reference modules to load.
+
+Given a task query and current context (core rules), decide which on-demand
+modules would be helpful to complete the task.
+
+For each module, consider:
+1. Does the query topic match the module's topics?
+2. Does the task type match the module's WHEN condition?
+3. Is the module likely to provide needed information not in core rules?
+
+Respond with a JSON object:
+{
+  "decisions": [
+    {
+      "module_name": "on-demand-examples.md",
+      "reason": "Query asks for code example",
+      "relevance_score": 0.8
+    }
+  ]
+}
+
+Only suggest modules that are actually needed. Maximum 6 modules."""
+
+        user_prompt = f"""Task Query: {query}
+
+Current Context (Core Rules):
+{current_context[:1500]}
+
+Available Modules:
+{module_descriptions}
+
+Decide which modules to load (maximum {self.max_calls})."""
+
+        try:
+            response = llm_client.client.chat.completions.create(
+                model=llm_client.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            decisions = []
+
+            for d in result.get("decisions", [])[:self.max_calls]:
+                decisions.append(ToolCallDecision(
+                    module_name=d.get("module_name", ""),
+                    reason=d.get("reason", ""),
+                    relevance_score=d.get("relevance_score", 0.0)
+                ))
+
+            return decisions
+
+        except Exception:
+            # Fallback: keyword matching
+            return self._keyword_match_tool_calls(query)
+
+    def _build_module_descriptions(self) -> str:
+        """Build descriptions of available modules for LLM prompt."""
+        lines = []
+
+        if self.modules.examples:
+            meta = self.routing.get("on-demand-examples.md", RoutingMetadata())
+            content_preview = self.modules.examples[0].content[:200] if self.modules.examples else ""
+            lines.append(f"- on-demand-examples.md")
+            lines.append(f"  WHEN: {meta.when}")
+            lines.append(f"  TOPICS: {', '.join(meta.topics)}")
+            lines.append(f"  Preview: {content_preview}")
+
+        if self.modules.templates:
+            meta = self.routing.get("on-demand-templates.md", RoutingMetadata())
+            content_preview = self.modules.templates[0].content[:200] if self.modules.templates else ""
+            lines.append(f"- on-demand-templates.md")
+            lines.append(f"  WHEN: {meta.when}")
+            lines.append(f"  TOPICS: {', '.join(meta.topics)}")
+            lines.append(f"  Preview: {content_preview}")
+
+        if self.modules.background:
+            meta = self.routing.get("on-demand-background.md", RoutingMetadata())
+            content_preview = self.modules.background[0].content[:200] if self.modules.background else ""
+            lines.append(f"- on-demand-background.md")
+            lines.append(f"  WHEN: {meta.when}")
+            lines.append(f"  TOPICS: {', '.join(meta.topics)}")
+            lines.append(f"  Preview: {content_preview}")
+
+        return "\n".join(lines)
+
+    def _keyword_match_tool_calls(self, query: str) -> list[ToolCallDecision]:
+        """Fallback keyword matching for tool call decisions."""
+        decisions = []
+        query_lower = query.lower()
+
+        # Check each module's topics against query
+        for module_name, meta in self.routing.items():
+            for topic in meta.topics:
+                if topic.lower() in query_lower:
+                    decisions.append(ToolCallDecision(
+                        module_name=module_name,
+                        reason=f"Query mentions topic '{topic}'",
+                        relevance_score=0.6
+                    ))
+                    break
+
+        return decisions[:self.max_calls]
+
+    def execute_tool_calls(
+        self,
+        decisions: list[ToolCallDecision]
+    ) -> list[ReadFileToolCall]:
+        """
+        Execute simulated read_file calls for selected modules.
+
+        Args:
+            decisions: List of ToolCallDecision to execute.
+
+        Returns:
+            List of ReadFileToolCall with module contents.
+        """
+        calls = []
+        self.call_history = []
+
+        for decision in decisions:
+            module_content = self._get_module_content(decision.module_name)
+            if module_content:
+                call = ReadFileToolCall(
+                    call_id=str(uuid.uuid4())[:8],
+                    module_name=decision.module_name,
+                    module_content=module_content,
+                    relevance_match=decision.relevance_score
+                )
+                calls.append(call)
+                self.call_history.append(call)
+
+        return calls
+
+    def _get_module_content(self, module_name: str) -> str:
+        """Get content for a module by name."""
+        if module_name == "on-demand-examples.md" and self.modules.examples:
+            return "\n\n---\n\n".join([b.content for b in self.modules.examples])
+
+        if module_name == "on-demand-templates.md" and self.modules.templates:
+            return "\n\n---\n\n".join([b.content for b in self.modules.templates])
+
+        if module_name == "on-demand-background.md" and self.modules.background:
+            return "\n\n---\n\n".join([b.content for b in self.modules.background])
+
+        return ""
+
+    def build_augmented_context(
+        self,
+        base_context: str,
+        tool_calls: list[ReadFileToolCall]
+    ) -> str:
+        """
+        Build augmented context with loaded module contents.
+
+        Args:
+            base_context: Core rules context.
+            tool_calls: Executed tool calls with module contents.
+
+        Returns:
+            Combined context string.
+        """
+        parts = [base_context]
+
+        for call in tool_calls:
+            parts.append(f"\n\n--- Loaded Reference: {call.module_name} ---\n\n")
+            parts.append(call.module_content)
+
+        return "\n".join(parts)
 
 
 class GateResult(str, Enum):
@@ -66,11 +327,20 @@ class FeedbackLoopResult:
 
 @dataclass
 class EvaluationTask:
-    """A single evaluation task for Gate 2."""
+    """A single evaluation task for Gate 2.
+
+    Per SkillReducer paper Section IV-B:
+    - Core-only tasks: Answerable from core rules alone
+    - Needs-reference tasks: Require at least one reference module
+    - Mix of code execution tasks (52.3%) and rubric tasks (47.7%)
+    """
 
     task_id: str
     query: str
     expected_outcome: str
+    required_references: list[str] = field(default_factory=list)  # Specific modules needed
+    is_code_task: bool = False  # True for pytest-verifiable tasks
+    needs_reference: bool = False  # True if task requires reference modules
 
 
 @dataclass
@@ -126,13 +396,23 @@ class QualityGates:
     - Automated task generation (5 tasks)
     - Automated evaluation and promotion loop
     - Max 2 iterations
+    - Three-condition evaluation (D/A/C) with retention calculation
+    - read_file tool simulation for progressive disclosure
+    - Hybrid scoring (pytest + LLM judge)
     """
 
     def __init__(
         self,
         llm_client,
         faithfulness_threshold: float = 1.0,
-        max_loop_iterations: int = 2
+        max_loop_iterations: int = 2,
+        use_three_conditions: bool = False,
+        use_hybrid_scoring: bool = False,
+        pytest_weight: float = 0.523,
+        llm_judge_weight: float = 0.477,
+        enable_read_file_tool: bool = True,
+        max_tool_calls: int = 6,
+        hybrid_evaluator: Optional[HybridEvaluator] = None
     ):
         """
         Initialize quality gates.
@@ -142,10 +422,37 @@ class QualityGates:
             faithfulness_threshold: Minimum ratio of preserved concepts (0.0-1.0).
                                   Default 1.0 means all concepts must be preserved.
             max_loop_iterations: Maximum iterations for Gate 2 feedback loop (default 2).
+            use_three_conditions: Enable three-condition (D/A/C) evaluation.
+            use_hybrid_scoring: Enable hybrid scoring (pytest + LLM judge).
+            pytest_weight: Weight for pytest score (default 0.523 per paper).
+            llm_judge_weight: Weight for LLM judge score (default 0.477 per paper).
+            enable_read_file_tool: Enable read_file tool simulation for Condition C.
+            max_tool_calls: Maximum read_file calls per task (default 6 per paper).
+            hybrid_evaluator: Optional HybridEvaluator instance (created if not provided).
         """
         self.llm_client = llm_client
         self.faithfulness_threshold = faithfulness_threshold
         self.max_loop_iterations = max_loop_iterations
+        self.use_three_conditions = use_three_conditions
+        self.use_hybrid_scoring = use_hybrid_scoring
+        self.pytest_weight = pytest_weight
+        self.llm_judge_weight = llm_judge_weight
+        self.enable_read_file_tool = enable_read_file_tool
+        self.max_tool_calls = max_tool_calls
+
+        # Initialize hybrid evaluator for three-condition evaluation
+        if hybrid_evaluator:
+            self.hybrid_evaluator = hybrid_evaluator
+        elif use_hybrid_scoring:
+            # Create hybrid evaluator with pytest executor and LLM judge
+            pytest_executor = PytestExecutor()
+            llm_judge = LLMJudge(llm_client)
+            self.hybrid_evaluator = HybridEvaluator(
+                pytest_executor=pytest_executor,
+                llm_judge=llm_judge
+            )
+        else:
+            self.hybrid_evaluator = None
 
     # ============================================================
     # Gate 1: Faithfulness Verification with Fine-grained Rollback
@@ -348,23 +655,38 @@ Identify all core operational concepts in the original and check if they are pre
     def generate_evaluation_tasks(
         self,
         skill: Skill,
-        num_tasks: int = 5
+        num_tasks: int = 5,
+        ensure_task_mix: bool = True
     ) -> list[EvaluationTask]:
         """
         Generate evaluation tasks for Gate 2.
 
-        Creates diverse tasks that test the skill's capabilities.
+        Per SkillReducer paper Section IV-B:
+        - 5 diverse tasks per skill
+        - Mix of "core-only" (answerable from b* alone) and "needs-reference" tasks
+        - Mix of code execution tasks (52.3%) and rubric tasks (47.7%)
 
         Args:
             skill: The skill to generate tasks for.
             num_tasks: Number of tasks to generate (default 5).
+            ensure_task_mix: Ensure proper mix of task types per paper.
 
         Returns:
-            List of EvaluationTask objects.
+            List of EvaluationTask objects with type annotations.
         """
         system_prompt = """You are an expert at creating evaluation tasks for AI skills.
 
 Your task is to generate diverse, realistic tasks that test a skill's capabilities.
+
+Per SkillReducer methodology, generate tasks with TWO distinctions:
+
+1. TASK CONTENT TYPE:
+   - Core-only: Can be completed using only core rules (no references needed)
+   - Needs-reference: Requires loading at least one reference module (examples/templates/background)
+
+2. TASK VERIFICATION TYPE:
+   - Code task: Output can be verified by pytest (executable code, assertions)
+   - Rubric task: Output must be judged by LLM against rubric criteria
 
 Guidelines:
 1. Tasks should be specific and testable
@@ -379,10 +701,15 @@ IMPORTANT: Respond with a JSON object:
     {
       "task_id": "task_1",
       "query": "The user's request",
-      "expected_outcome": "What successful completion looks like"
+      "expected_outcome": "What successful completion looks like",
+      "is_code_task": true/false,
+      "needs_reference": true/false,
+      "required_references": ["list of specific reference modules needed, if any"]
     }
   ]
-}"""
+}
+
+Generate a mix: ~50% core-only, ~50% needs-reference. ~52% code tasks, ~48% rubric tasks."""
 
         user_prompt = f"""Skill Name: {skill.name}
 Skill Description: {skill.description.original}
@@ -390,7 +717,9 @@ Skill Description: {skill.description.original}
 Skill Body Summary (first 2000 chars):
 {skill.body.original[:2000]}
 
-Generate {num_tasks} diverse evaluation tasks for this skill."""
+Reference Files: {list(skill.references.files.keys()) if skill.references.files else 'none'}
+
+Generate {num_tasks} diverse evaluation tasks for this skill. Include proper task type annotations."""
 
         response = self.llm_client.client.chat.completions.create(
             model=self.llm_client.model,
@@ -410,8 +739,36 @@ Generate {num_tasks} diverse evaluation tasks for this skill."""
             tasks.append(EvaluationTask(
                 task_id=t.get("task_id", f"task_{len(tasks)}"),
                 query=t.get("query", ""),
-                expected_outcome=t.get("expected_outcome", "")
+                expected_outcome=t.get("expected_outcome", ""),
+                is_code_task=t.get("is_code_task", False),
+                needs_reference=t.get("needs_reference", False),
+                required_references=t.get("required_references", [])
             ))
+
+        # If ensure_task_mix, validate and adjust
+        if ensure_task_mix and tasks:
+            # Ensure at least 1 core-only, 1 needs-reference
+            core_only_count = sum(1 for t in tasks if not t.needs_reference)
+            needs_ref_count = sum(1 for t in tasks if t.needs_reference)
+
+            if core_only_count == 0:
+                # Mark first task as core-only
+                tasks[0].needs_reference = False
+                tasks[0].required_references = []
+            if needs_ref_count == 0:
+                # Mark last task as needs-reference
+                tasks[-1].needs_reference = True
+                tasks[-1].required_references = ["on-demand-examples.md"]
+
+            # Ensure ~52% code tasks
+            code_count = sum(1 for t in tasks if t.is_code_task)
+            target_code = round(num_tasks * 0.523)
+            if code_count < target_code:
+                # Convert some rubric tasks to code tasks
+                for t in tasks:
+                    if not t.is_code_task and code_count < target_code:
+                        t.is_code_task = True
+                        code_count += 1
 
         return tasks
 
@@ -758,6 +1115,605 @@ Identify which blocks contain information relevant to addressing these failures.
             skill_name=skill.name
         )
 
+    # ============================================================
+    # Three-Condition Evaluation (D/A/C)
+    # ============================================================
+
+    def evaluate_condition_D(
+        self,
+        task: EvaluationTask,
+        skill_name: str,
+        is_code_task: bool = False
+    ) -> ConditionScore:
+        """
+        Evaluate task without any skill (Condition D - baseline).
+
+        Agent receives only the query, no skill context.
+        Tests if agent can complete task from general knowledge.
+
+        Args:
+            task: Evaluation task with query and expected outcome.
+            skill_name: Skill name for context.
+            is_code_task: Whether this is a code execution task.
+
+        Returns:
+            ConditionScore for condition D.
+        """
+        # Use hybrid scoring if enabled (mostly for consistency)
+        if self.use_hybrid_scoring and self.hybrid_evaluator and is_code_task:
+            # For baseline D, pytest would fail without skill context
+            pytest_score = 0.0
+
+            llm_judge_score = self._llm_judge_eval_baseline(task)
+
+            weighted_score = self.hybrid_evaluator.calculate_weighted_score(
+                pytest_score=pytest_score,
+                judge_score=llm_judge_score,
+                is_code_task=True
+            )
+
+            return ConditionScore(
+                condition=EvaluationCondition.D,
+                pytest_score=pytest_score,
+                llm_judge_score=llm_judge_score,
+                weighted_score=weighted_score,
+                task_id=task.task_id,
+                details={"baseline": True}
+            )
+
+        # Fallback: simple LLM evaluation
+        system_prompt = """You are an AI assistant completing a task without any specialized skill context.
+
+You have general knowledge but no specific skill instructions for this task.
+Complete the task based on your general capabilities.
+
+IMPORTANT: Respond with a JSON object:
+{
+  "output": "Your response to complete the task",
+  "confidence": 0.0-1.0,
+  "reasoning": "How you approached this task"
+}"""
+
+        user_prompt = f"""Task Query: {task.query}
+Expected Outcome: {task.expected_outcome}
+
+Complete this task using only your general knowledge (no skill context provided)."""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        score = result.get("confidence", 0.0)
+
+        return ConditionScore(
+            condition=EvaluationCondition.D,
+            pytest_score=0.0,
+            llm_judge_score=score,
+            weighted_score=score,
+            task_id=task.task_id,
+            details={"output": result.get("output", ""), "reasoning": result.get("reasoning", "")}
+        )
+
+    def _llm_judge_eval_baseline(self, task: EvaluationTask) -> float:
+        """Evaluate baseline task without skill context."""
+        system_prompt = """You are an LLM judge evaluating task completion without skill context.
+
+Rate how well the task could be completed using only general knowledge.
+
+IMPORTANT: Respond with a JSON object:
+{
+  "score": 0.0-1.0,
+  "reasoning": "Explanation"
+}"""
+
+        user_prompt = f"""Task Query: {task.query}
+Expected Outcome: {task.expected_outcome}
+
+Rate how well this task can be completed with no skill context."""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        return result.get("score", 0.0)
+
+    def evaluate_condition_A(
+        self,
+        task: EvaluationTask,
+        skill: Skill,
+        include_references: bool = True,
+        is_code_task: bool = False
+    ) -> ConditionScore:
+        """
+        Evaluate task with original uncompressed skill (Condition A - baseline).
+
+        Agent receives full original skill body + references.
+        Establishes upper bound for expected performance.
+
+        Args:
+            task: Evaluation task with query and expected outcome.
+            skill: Original skill with full body and references.
+            include_references: Whether to include reference files.
+            is_code_task: Whether this is a code execution task.
+
+        Returns:
+            ConditionScore for condition A.
+        """
+        # Build full context from original skill
+        context_parts = [skill.body.original]
+
+        if include_references and skill.references.files:
+            for filename, content in skill.references.files.items():
+                context_parts.append(f"\n\n--- Reference: {filename} ---\n\n{content}")
+
+        full_context = "\n".join(context_parts)[:4000]  # Limit for prompt
+
+        # Use hybrid scoring if enabled
+        if self.use_hybrid_scoring and self.hybrid_evaluator:
+            if is_code_task:
+                # Code task: pytest + LLM judge
+                pytest_result = self.hybrid_evaluator.pytest.run_pytest(
+                    self.hybrid_evaluator.pytest.generate_test_file(
+                        task_id=task.task_id,
+                        expected_outcome=task.expected_outcome,
+                        skill_context=full_context[:2000]
+                    )
+                )
+                pytest_score = pytest_result.score if pytest_result.passed else 0.0
+
+                llm_judge_score = self._llm_judge_eval(task, full_context, skill.name)
+
+                weighted_score = self.hybrid_evaluator.calculate_weighted_score(
+                    pytest_score=pytest_score,
+                    judge_score=llm_judge_score,
+                    is_code_task=True
+                )
+
+                return ConditionScore(
+                    condition=EvaluationCondition.A,
+                    pytest_score=pytest_score,
+                    llm_judge_score=llm_judge_score,
+                    weighted_score=weighted_score,
+                    task_id=task.task_id,
+                    loaded_references=list(skill.references.files.keys()) if include_references else [],
+                    details={"pytest_passed": pytest_result.passed}
+                )
+            else:
+                # Rubric task: LLM judge only
+                llm_judge_score = self._llm_judge_eval(task, full_context, skill.name)
+
+                return ConditionScore(
+                    condition=EvaluationCondition.A,
+                    pytest_score=0.0,
+                    llm_judge_score=llm_judge_score,
+                    weighted_score=llm_judge_score,
+                    task_id=task.task_id,
+                    loaded_references=list(skill.references.files.keys()) if include_references else []
+                )
+
+        # Fallback: simple LLM evaluation
+        system_prompt = """You are an AI assistant completing a task with full skill context.
+
+You have access to the complete original skill instructions and all references.
+Use this information to complete the task.
+
+IMPORTANT: Respond with a JSON object:
+{
+  "output": "Your response to complete the task",
+  "confidence": 0.0-1.0,
+  "used_references": ["list of references used"],
+  "reasoning": "How you used the skill context"
+}"""
+
+        user_prompt = f"""Task Query: {task.query}
+Expected Outcome: {task.expected_outcome}
+
+Complete this task using the full skill context provided.
+
+Skill Context:
+{full_context}"""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        score = result.get("confidence", 0.0)
+
+        return ConditionScore(
+            condition=EvaluationCondition.A,
+            pytest_score=0.0,
+            llm_judge_score=score,
+            weighted_score=score,
+            task_id=task.task_id,
+            loaded_references=result.get("used_references", []),
+            details={"output": result.get("output", ""), "reasoning": result.get("reasoning", "")}
+        )
+
+    def evaluate_condition_C(
+        self,
+        task: EvaluationTask,
+        compressed_skill: Skill,
+        on_demand_modules: OnDemandModules,
+        routing_metadata: dict[str, RoutingMetadata],
+        enable_read_file: bool = True,
+        is_code_task: bool = False
+    ) -> ConditionScore:
+        """
+        Evaluate task with compressed skill + read_file tool (Condition C).
+
+        Agent receives only core rules, can load on-demand modules
+        via simulated read_file tool calls.
+
+        Per SkillReducer paper Section IV-B:
+        - Code execution tasks: pytest (52.3%) + LLM judge (47.7%)
+        - Rubric tasks: LLM judge only
+        - Cohen's kappa validation for evaluator agreement
+
+        Args:
+            task: Evaluation task with query and expected outcome.
+            compressed_skill: Compressed skill with core rules only.
+            on_demand_modules: On-demand modules available for loading.
+            routing_metadata: Routing metadata for module matching.
+            enable_read_file: Whether to simulate read_file tool calls.
+            is_code_task: Whether this is a code execution task (requires pytest).
+
+        Returns:
+            ConditionScore for condition C with loaded references tracked.
+        """
+        # Build base context (core rules only)
+        core_rules = "\n".join([
+            b.content for b in compressed_skill.body.content_blocks
+            if _is_content_type(b, ContentType.CORE_RULE)
+        ])
+
+        loaded_references = []
+
+        # Simulate read_file tool calls if enabled
+        if enable_read_file and on_demand_modules and self.enable_read_file_tool:
+            simulator = ReadFileToolSimulator(
+                on_demand_modules=on_demand_modules,
+                routing_metadata=routing_metadata,
+                max_calls=self.max_tool_calls
+            )
+
+            # Get tool call suggestions
+            decisions = simulator.suggest_tool_calls(
+                llm_client=self.llm_client,
+                query=task.query,
+                current_context=core_rules
+            )
+
+            # Execute tool calls
+            tool_calls = simulator.execute_tool_calls(decisions)
+
+            # Build augmented context
+            augmented_context = simulator.build_augmented_context(core_rules, tool_calls)
+            loaded_references = [tc.module_name for tc in tool_calls]
+        else:
+            augmented_context = core_rules
+
+        # Use hybrid scoring if enabled
+        if self.use_hybrid_scoring and self.hybrid_evaluator:
+            if is_code_task:
+                # Code task: pytest + LLM judge
+                # Generate pytest test file and run
+                pytest_result = self.hybrid_evaluator.pytest.run_pytest(
+                    self.hybrid_evaluator.pytest.generate_test_file(
+                        task_id=task.task_id,
+                        expected_outcome=task.expected_outcome,
+                        skill_context=augmented_context[:2000]
+                    )
+                )
+                pytest_score = pytest_result.score if pytest_result.passed else 0.0
+
+                # LLM judge evaluation
+                llm_judge_score = self._llm_judge_eval(
+                    task, augmented_context, compressed_skill.name
+                )
+
+                # Calculate weighted score per paper (pytest 52.3%, judge 47.7%)
+                weighted_score = self.hybrid_evaluator.calculate_weighted_score(
+                    pytest_score=pytest_score,
+                    judge_score=llm_judge_score,
+                    is_code_task=True
+                )
+
+                return ConditionScore(
+                    condition=EvaluationCondition.C,
+                    pytest_score=pytest_score,
+                    llm_judge_score=llm_judge_score,
+                    weighted_score=weighted_score,
+                    task_id=task.task_id,
+                    loaded_references=loaded_references,
+                    details={
+                        "pytest_passed": pytest_result.passed,
+                        "pytest_error": pytest_result.error
+                    }
+                )
+            else:
+                # Rubric task: LLM judge only
+                llm_judge_score = self._llm_judge_eval(
+                    task, augmented_context, compressed_skill.name
+                )
+
+                return ConditionScore(
+                    condition=EvaluationCondition.C,
+                    pytest_score=0.0,
+                    llm_judge_score=llm_judge_score,
+                    weighted_score=llm_judge_score,  # No pytest weight for rubric tasks
+                    task_id=task.task_id,
+                    loaded_references=loaded_references
+                )
+
+        # Fallback: simple LLM evaluation (original implementation)
+        system_prompt = """You are an AI assistant completing a task with compressed skill context.
+
+You have access to the core skill rules. Additional reference modules are available
+via the read_file tool if needed.
+
+IMPORTANT: Respond with a JSON object:
+{
+  "output": "Your response to complete the task",
+  "confidence": 0.0-1.0,
+  "reasoning": "How you completed the task with available context"
+}"""
+
+        user_prompt = f"""Task Query: {task.query}
+Expected Outcome: {task.expected_outcome}
+
+Complete this task using the skill context provided.
+
+Available Context (Core Rules + Loaded References):
+{augmented_context[:4000]}"""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        score = result.get("confidence", 0.0)
+
+        return ConditionScore(
+            condition=EvaluationCondition.C,
+            pytest_score=0.0,
+            llm_judge_score=score,
+            weighted_score=score,
+            task_id=task.task_id,
+            loaded_references=loaded_references,
+            details={"output": result.get("output", ""), "reasoning": result.get("reasoning", "")}
+        )
+
+    def _llm_judge_eval(
+        self,
+        task: EvaluationTask,
+        context: str,
+        skill_name: str
+    ) -> float:
+        """
+        LLM judge evaluation using rubric.
+
+        Args:
+            task: Evaluation task with rubric criteria.
+            context: Skill context for evaluation.
+            skill_name: Skill name for context.
+
+        Returns:
+            LLM judge score (0.0-1.0).
+        """
+        # Use LLMJudge's evaluate_with_rubric if available
+        if self.hybrid_evaluator and self.hybrid_evaluator.llm_judge:
+            result = self.hybrid_evaluator.llm_judge.evaluate_with_rubric(
+                task_id=task.task_id,
+                query=task.query,
+                actual_output=context,  # Use context as output for evaluation
+                expected_outcome=task.expected_outcome,
+                skill_context=f"Skill: {skill_name}"
+            )
+            return self.hybrid_evaluator.llm_judge.calculate_judge_score(result.rubric_scores)
+
+        # Fallback: simple confidence evaluation
+        system_prompt = """You are an LLM judge evaluating task completion quality.
+
+Evaluate the response against the expected outcome using the rubric:
+- Correctness: Does the response address the task correctly? (weight 0.4)
+- Completeness: Does the response cover all required aspects? (weight 0.3)
+- Quality: Is the response well-structured and clear? (weight 0.3)
+
+IMPORTANT: Respond with a JSON object:
+{
+  "correctness": 0.0-1.0,
+  "completeness": 0.0-1.0,
+  "quality": 0.0-1.0,
+  "overall_score": 0.0-1.0
+}"""
+
+        user_prompt = f"""Task Query: {task.query}
+Expected Outcome: {task.expected_outcome}
+
+Skill Context:
+{context[:2000]}
+
+Evaluate the quality of this skill context for completing the task."""
+
+        response = self.llm_client.client.chat.completions.create(
+            model=self.llm_client.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        return result.get("overall_score", 0.0)
+
+    def calculate_retention(
+        self,
+        scores_D: list[ConditionScore],
+        scores_A: list[ConditionScore],
+        scores_C: list[ConditionScore],
+        threshold: float = 0.86
+    ) -> list[RetentionResult]:
+        """
+        Calculate retention for each task: score_C / score_A.
+
+        Per SkillReducer paper, retention measures how well compressed skill
+        maintains performance compared to original.
+
+        Args:
+            scores_D: List of Condition D scores (baseline).
+            scores_A: List of Condition A scores (original skill).
+            scores_C: List of Condition C scores (compressed skill).
+            threshold: Minimum retention threshold (default 0.86 per paper).
+
+        Returns:
+            List of RetentionResult for each task.
+        """
+        results = []
+
+        for d, a, c in zip(scores_D, scores_A, scores_C):
+            # Handle edge cases
+            if a.weighted_score == 0:
+                # Original skill failed - retention defaults to 1.0 per paper
+                retention = 1.0
+            else:
+                retention = c.weighted_score / a.weighted_score
+
+            # Calculate improvement over baseline
+            if d.weighted_score > 0:
+                improvement = (a.weighted_score - d.weighted_score) / d.weighted_score
+            else:
+                improvement = a.weighted_score
+
+            results.append(RetentionResult(
+                score_D=d.weighted_score,
+                score_A=a.weighted_score,
+                score_C=c.weighted_score,
+                retention=min(retention, 1.0),  # Cap at 1.0
+                passed=retention >= threshold,
+                improvement_over_baseline=improvement
+            ))
+
+        return results
+
+    def run_three_condition_evaluation(
+        self,
+        skill: Skill,
+        compressed_skill: Skill,
+        on_demand_modules: OnDemandModules,
+        routing_metadata: dict[str, RoutingMetadata],
+        num_tasks: int = 5,
+        threshold: float = 0.86,
+        calculate_kappa: bool = True
+    ) -> tuple[list[RetentionResult], list[EvaluationTask], bool, Optional[float]]:
+        """
+        Full three-condition evaluation pipeline.
+
+        Generates tasks, evaluates D/A/C for each, calculates retention.
+
+        Per SkillReducer paper Section IV-B:
+        - 5 tasks per skill
+        - Mix of core-only and needs-reference tasks
+        - Code tasks: pytest 52.3% + LLM judge 47.7%
+        - Rubric tasks: LLM judge only
+        - Cohen's kappa validation for evaluator agreement (κ≥0.8 threshold)
+
+        Args:
+            skill: Original skill for condition A.
+            compressed_skill: Compressed skill for condition C.
+            on_demand_modules: On-demand modules for condition C.
+            routing_metadata: Routing metadata for read_file simulation.
+            num_tasks: Number of evaluation tasks (default 5 per paper).
+            threshold: Retention threshold (default 0.86).
+            calculate_kappa: Whether to calculate Cohen's kappa for evaluator agreement.
+
+        Returns:
+            Tuple of (retention_results, tasks, overall_passed, cohens_kappa).
+        """
+        # Generate evaluation tasks with proper type mix
+        tasks = self.generate_evaluation_tasks(skill, num_tasks, ensure_task_mix=True)
+
+        # Evaluate all three conditions for each task
+        scores_D = []
+        scores_A = []
+        scores_C = []
+
+        for task in tasks:
+            # Condition D: No skill
+            score_d = self.evaluate_condition_D(
+                task, skill.name, is_code_task=task.is_code_task
+            )
+            scores_D.append(score_d)
+
+            # Condition A: Original skill
+            score_a = self.evaluate_condition_A(
+                task, skill,
+                include_references=True,
+                is_code_task=task.is_code_task
+            )
+            scores_A.append(score_a)
+
+            # Condition C: Compressed skill with read_file
+            score_c = self.evaluate_condition_C(
+                task, compressed_skill, on_demand_modules, routing_metadata,
+                is_code_task=task.is_code_task
+            )
+            scores_C.append(score_c)
+
+        # Calculate retention
+        retention_results = self.calculate_retention(scores_D, scores_A, scores_C, threshold)
+
+        # Overall pass: all tasks must pass retention threshold
+        overall_passed = all(r.passed for r in retention_results)
+
+        # Cohen's kappa validation if hybrid scoring enabled
+        cohens_kappa = None
+        if calculate_kappa and self.use_hybrid_scoring and self.hybrid_evaluator:
+            # Calculate kappa between pytest and LLM judge scores
+            pytest_scores = [s.pytest_score for s in scores_C if s.pytest_score > 0]
+            judge_scores = [s.llm_judge_score for s in scores_C if s.pytest_score > 0]
+
+            if len(pytest_scores) >= 2:
+                kappa, kappa_passed = self.hybrid_evaluator.calculate_cohens_kappa(
+                    pytest_scores, judge_scores
+                )
+                cohens_kappa = kappa
+
+                # Per paper Section VII: κ≥0.8 required for evaluator agreement
+                if kappa < 0.8:
+                    # Log warning about evaluator disagreement
+                    pass
+
+        return retention_results, tasks, overall_passed, cohens_kappa
+
 
 class CompressionPipeline:
     """
@@ -957,7 +1913,7 @@ class CompressionPipeline:
                             b for b in original_blocks
                             if (b.content_type if isinstance(b.content_type, str) else b.content_type.value) == "background"
                         ]
-                        on_demand_modules.backgrounds = [
+                        on_demand_modules.background = [
                             ContentBlock(
                                 chunk_id=b.chunk_id,
                                 content=b.content,

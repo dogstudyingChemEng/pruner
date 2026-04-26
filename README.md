@@ -158,7 +158,7 @@ skill = parse_skill_file("Claude-Skills/marketing/marketing-strategy-pmm/SKILL.m
 client = SkillLLMClient(
     api_key="your-api-key",
     base_url="https://api.deepseek.com/v1",
-    model="deepseek-chat"
+    model="deepseek-v4-flash"
 )
 
 # 3. 运行完整压缩流水线
@@ -396,7 +396,7 @@ from src.llm_client import SkillLLMClient
 client = SkillLLMClient(
     api_key="your-key",
     base_url="https://api.deepseek.com/v1",  # 可选
-    model="deepseek-chat"
+    model="deepseek-v4-flash"
 )
 
 # 测试连接
@@ -475,7 +475,7 @@ Product marketing is the process of bringing a product to market...
 | 提供商 | base_url | model |
 |--------|----------|-------|
 | OpenAI | https://api.openai.com/v1 | gpt-4o-mini, gpt-4o |
-| DeepSeek | https://api.deepseek.com/v1 | deepseek-chat |
+| DeepSeek | https://api.deepseek.com/v1 | deepseek-v4-flash |
 | Qwen | https://dashscope.aliyuncs.com/compatible-mode/v1 | qwen-turbo, qwen-plus |
 | 本地模型 | http://localhost:8000/v1 | 根据部署配置 |
 

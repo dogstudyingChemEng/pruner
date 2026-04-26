@@ -759,7 +759,7 @@ def main():
     # Auto-detect model based on base_url
     default_model = "gpt-4o-mini"
     if "deepseek" in base_url.lower():
-        default_model = "deepseek-chat"
+        default_model = "deepseek-v4-flash"
     elif "qwen" in base_url.lower() or "dashscope" in base_url.lower():
         default_model = "qwen-plus"
 

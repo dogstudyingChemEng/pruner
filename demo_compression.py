@@ -37,12 +37,12 @@ def main():
         return
 
     print(f"Base URL: {base_url}")
-    print(f"Model: deepseek-chat")
+    print(f"Model: deepseek-v4-flash")
 
     client = SkillLLMClient(
         api_key=api_key,
         base_url=base_url,
-        model="deepseek-chat"
+        model="deepseek-v4-flash"
     )
 
     # Test connection
