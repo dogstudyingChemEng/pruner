@@ -462,19 +462,30 @@ class QualityGates:
         self,
         original_body: str,
         compressed_core_rules: str,
-        skill_name: str = "unknown"
+        skill_name: str = "unknown",
+        reference_modules: Optional[dict[str, str]] = None
     ) -> FaithfulnessResult:
         """
         Gate 1: Verify that all core operational concepts are preserved.
 
+        Per paper Eq. 3: ∀τ : C_τ(s.b) ⊆ C_τ(b*) ∪ ∪_{r∈R*} C_τ(r)
+
         Checks if all 'core operational concepts' from the original body
-        are preserved in the compressed core rules. If concepts are missing,
-        identifies which content types need rollback.
+        are preserved EITHER in the compressed core rules OR in reference
+        modules (examples, templates, background). Concepts that appear in
+        reference modules are NOT missing — they were correctly moved by
+        progressive disclosure.
+
+        If concepts are missing from both, identifies which content types
+        need rollback.
 
         Args:
             original_body: The original skill body text.
             compressed_core_rules: The compressed core rules.
             skill_name: Skill name for context.
+            reference_modules: Optional dict of reference module filenames
+                to their content (e.g., {"on-demand-examples.md": "..."}).
+                Per paper Eq. 3, concepts in these modules count as preserved.
 
         Returns:
             FaithfulnessResult with verification details and rollback types.
@@ -504,7 +515,12 @@ class QualityGates:
         system_prompt = """You are a quality assurance expert for technical documentation compression.
 
 Your task is to verify that all CORE OPERATIONAL CONCEPTS from the original document
-are preserved in the compressed version.
+are preserved somewhere in the output. Per the SkillReducer paper (Eq. 3), concepts
+can be preserved in EITHER the compressed core rules OR the reference modules.
+
+Reference modules (examples.md, templates.md, background.md) contain content that
+was intentionally moved out of the core by progressive disclosure. If a concept from
+the original body appears in a reference module, it is PRESERVED (not missing).
 
 Core operational concepts include:
 - Specific actions or steps that must be performed
@@ -514,8 +530,10 @@ Core operational concepts include:
 - Critical conditions or triggers
 
 Do NOT flag as missing:
-- Background information or explanations
-- Examples or demonstrations
+- Concepts that appear in the reference modules (they were moved, not lost)
+- Background information or explanations (correctly in background.md)
+- Examples or demonstrations (correctly in examples.md)
+- Templates or boilerplate (correctly in templates.md)
 - Optional details or nice-to-have context
 - Redundant or repeated information
 
@@ -532,7 +550,7 @@ IMPORTANT: Respond with a JSON object:
     "concept 2 from original"
   ],
   "preserved_concepts": [
-    "concept that was preserved in compressed"
+    "concept that was preserved (in core OR in a reference module)"
   ],
   "missing_concepts": [
     {
@@ -541,18 +559,28 @@ IMPORTANT: Respond with a JSON object:
     }
   ],
   "faithfulness_score": 0.95,
-  "reasoning": "Explanation of the verification result"
+  "reasoning": "Explanation of the verification result, noting which concepts were found in reference modules"
 }"""
+
+        # Build reference modules section for the prompt
+        reference_section = ""
+        if reference_modules:
+            ref_parts = []
+            for ref_name, ref_content in reference_modules.items():
+                if ref_content and ref_content.strip():
+                    ref_parts.append(f"--- {ref_name} ---\n{ref_content[:2000]}")
+            if ref_parts:
+                reference_section = "\n\nREFERENCE MODULES (content moved here by progressive disclosure — concepts found here are PRESERVED, not missing):\n\n" + "\n\n".join(ref_parts)
 
         user_prompt = f"""Skill Name: {skill_name}
 
 ORIGINAL BODY:
-{original_body[:4000]}
+{original_body[:8000]}
 
 COMPRESSED CORE RULES:
-{compressed_core_rules}
+{compressed_core_rules}{reference_section}
 
-Identify all core operational concepts in the original and check if they are preserved in the compressed version. For missing concepts, identify their likely content type."""
+Identify all core operational concepts in the original and check if they are preserved in the compressed core rules OR in the reference modules. A concept found in a reference module is PRESERVED — do NOT flag it as missing."""
 
         response = self.llm_client.client.chat.completions.create(
             model=self.llm_client.model,
@@ -846,7 +874,8 @@ Can this skill successfully complete the task with only these core rules?"""
         self,
         blocks: list[ContentBlock],
         failed_criteria: list[str],
-        skill_context: Optional[str] = None
+        skill_context: Optional[str] = None,
+        original_blocks: Optional[list[ContentBlock]] = None
     ) -> FeedbackLoopResult:
         """
         Gate 2: Promote relevant blocks to core_rule based on task failure feedback.
@@ -855,10 +884,15 @@ Can this skill successfully complete the task with only these core rules?"""
         blocks related to the failure criteria and promotes them to core_rule
         type to ensure they are always loaded.
 
+        Per paper: promoted items are appended to the core in their original
+        form without further compression.
+
         Args:
-            blocks: List of classified content blocks.
+            blocks: List of classified content blocks (possibly compressed).
             failed_criteria: List of criteria that caused task failure.
             skill_context: Optional context about the skill.
+            original_blocks: Original uncompressed blocks for restoring
+                promoted content to its original form.
 
         Returns:
             FeedbackLoopResult with promotion details.
@@ -955,6 +989,11 @@ Identify which blocks contain information relevant to addressing these failures.
 
         # Promote relevant blocks
         promoted_ids = []
+        # Build lookup of original blocks by chunk_id for restoring uncompressed content
+        original_by_id = {}
+        if original_blocks:
+            original_by_id = {b.chunk_id: b for b in original_blocks}
+
         for rel_block in relevant_blocks:
             block_id = rel_block.get("block_id", "")
             for block in blocks:
@@ -963,8 +1002,12 @@ Identify which blocks contain information relevant to addressing these failures.
                     (isinstance(block.content_type, str) and block.content_type in promotable_type_values)
                 )
                 if block.chunk_id == block_id and is_promotable:
-                    # Promote to core_rule
+                    # Promote to core_rule, restoring original content if available
                     block.content_type = ContentType.CORE_RULE
+                    if block_id in original_by_id:
+                        orig = original_by_id[block_id]
+                        block.content = orig.content
+                        block.token_count = orig.token_count
                     promoted_ids.append(block_id)
                     break
 
@@ -986,7 +1029,8 @@ Identify which blocks contain information relevant to addressing these failures.
         skill: Skill,
         initial_blocks: list[ContentBlock],
         stage2_optimizer: Stage2Optimizer,
-        max_iterations: int = 2
+        max_iterations: int = 2,
+        original_blocks: Optional[list[ContentBlock]] = None
     ) -> AutomatedLoopResult:
         """
         Run the fully automated Gate 2 feedback loop.
@@ -994,22 +1038,29 @@ Identify which blocks contain information relevant to addressing these failures.
         Steps:
         1. Generate 5 evaluation tasks
         2. Evaluate all tasks
-        3. If any fail, promote relevant blocks
-        4. Re-compress core rules
+        3. If any fail, promote relevant blocks (in original form, per paper)
+        4. Re-compress only existing core rules (not newly promoted blocks)
         5. Re-evaluate
         6. Repeat up to max_iterations times
+
+        Per paper: promoted items are appended to the core in their original
+        form without further compression. Only non-promoted core items retain
+        their compressed form.
 
         Args:
             skill: The skill being evaluated.
             initial_blocks: The initial compressed blocks.
             stage2_optimizer: Stage2 optimizer for re-compression.
             max_iterations: Maximum loop iterations (default 2).
+            original_blocks: Original uncompressed blocks for restoring
+                promoted content to its original form.
 
         Returns:
             AutomatedLoopResult with final blocks and status.
         """
         current_blocks = list(initial_blocks)
         all_promoted = []
+        newly_promoted_ids: set = set()  # Track blocks promoted in this loop
 
         for iteration in range(1, max_iterations + 1):
             # Generate evaluation tasks
@@ -1045,26 +1096,48 @@ Identify which blocks contain information relevant to addressing these failures.
 
             # Not all passed - do promotion
             if all_failure_reasons:
+                prev_promoted_count = len(all_promoted)
                 feedback_result = self.feedback_loop(
                     current_blocks,
                     all_failure_reasons,
-                    skill_context=f"{skill.name}: {skill.description.original}"
+                    skill_context=f"{skill.name}: {skill.description.original}",
+                    original_blocks=original_blocks
                 )
 
                 if feedback_result.promotion_count > 0:
-                    all_promoted.extend(feedback_result.promoted_blocks)
+                    # Track newly promoted block IDs from this iteration
+                    new_promotions = feedback_result.promoted_blocks[prev_promoted_count:] if len(all_promoted) < len(feedback_result.promoted_blocks) else feedback_result.promoted_blocks
+                    newly_promoted_ids.update(feedback_result.promoted_blocks)
+                    all_promoted = feedback_result.promoted_blocks
 
-                    # Re-compress core rules with newly promoted blocks
-                    core_blocks = [b for b in current_blocks if _is_content_type(b, ContentType.CORE_RULE)]
-                    if core_blocks:
-                        compressed_core = stage2_optimizer.compress_core_rules(core_blocks)
+                    # Separate existing core blocks (re-compress) from
+                    # newly promoted blocks (keep original, per paper)
+                    existing_core = [
+                        b for b in current_blocks
+                        if _is_content_type(b, ContentType.CORE_RULE)
+                        and b.chunk_id not in newly_promoted_ids
+                    ]
+                    promoted_core = [
+                        b for b in current_blocks
+                        if _is_content_type(b, ContentType.CORE_RULE)
+                        and b.chunk_id in newly_promoted_ids
+                    ]
 
-                        # Update blocks: remove old core, add new compressed
-                        non_core = [b for b in current_blocks if not _is_content_type(b, ContentType.CORE_RULE)]
-                        current_blocks = compressed_core + non_core
+                    if existing_core:
+                        compressed_existing = stage2_optimizer.compress_core_rules(existing_core)
+                    else:
+                        compressed_existing = []
+
+                    # Keep promoted blocks in original form (no re-compression)
+                    # Combine: compressed existing core + unmodified promoted blocks + non-core
+                    non_core = [
+                        b for b in current_blocks
+                        if not _is_content_type(b, ContentType.CORE_RULE)
+                    ]
+                    current_blocks = compressed_existing + promoted_core + non_core
 
             # If no promotions happened, we can't improve further
-            if not all_failure_reasons or (feedback_result and feedback_result.promotion_count == 0):
+            if not all_failure_reasons or feedback_result.promotion_count == 0:
                 break
 
         # Final evaluation
@@ -1091,14 +1164,20 @@ Identify which blocks contain information relevant to addressing these failures.
     def run_faithfulness_gate(
         self,
         skill: Skill,
-        compressed_blocks: list[ContentBlock]
+        compressed_blocks: list[ContentBlock],
+        reference_modules: Optional[dict[str, str]] = None
     ) -> FaithfulnessResult:
         """
         Run Gate 1 on a skill with compressed blocks.
 
+        Per paper Eq. 3, reference modules are included in the verification:
+        concepts moved to on-demand modules count as preserved.
+
         Args:
             skill: The original skill.
             compressed_blocks: The compressed content blocks.
+            reference_modules: Optional dict of reference file contents
+                (e.g., {"on-demand-examples.md": "...", ...}).
 
         Returns:
             FaithfulnessResult.
@@ -1112,7 +1191,8 @@ Identify which blocks contain information relevant to addressing these failures.
         return self.verify_faithfulness(
             original_body=skill.body.original,
             compressed_core_rules=core_rules,
-            skill_name=skill.name
+            skill_name=skill.name,
+            reference_modules=reference_modules
         )
 
     # ============================================================
@@ -1580,7 +1660,7 @@ Evaluate the quality of this skill context for completing the task."""
         scores_D: list[ConditionScore],
         scores_A: list[ConditionScore],
         scores_C: list[ConditionScore],
-        threshold: float = 0.86
+        threshold: float = 1.0
     ) -> list[RetentionResult]:
         """
         Calculate retention for each task: score_C / score_A.
@@ -1592,7 +1672,7 @@ Evaluate the quality of this skill context for completing the task."""
             scores_D: List of Condition D scores (baseline).
             scores_A: List of Condition A scores (original skill).
             scores_C: List of Condition C scores (compressed skill).
-            threshold: Minimum retention threshold (default 0.86 per paper).
+            threshold: Minimum retention threshold (default 1.0 per paper).
 
         Returns:
             List of RetentionResult for each task.
@@ -1631,7 +1711,7 @@ Evaluate the quality of this skill context for completing the task."""
         on_demand_modules: OnDemandModules,
         routing_metadata: dict[str, RoutingMetadata],
         num_tasks: int = 5,
-        threshold: float = 0.86,
+        threshold: float = 1.0,
         calculate_kappa: bool = True
     ) -> tuple[list[RetentionResult], list[EvaluationTask], bool, Optional[float]]:
         """
@@ -1727,7 +1807,10 @@ class CompressionPipeline:
         stage2_optimizer: Optional[Stage2Optimizer] = None,
         quality_gates: Optional[QualityGates] = None,
         enable_gate1: bool = True,
-        enable_gate2: bool = True
+        enable_gate2: bool = True,
+        use_real_cli: bool = False,
+        cli_path: str = "claude",
+        cli_timeout: int = 60
     ):
         """
         Initialize the compression pipeline.
@@ -1739,9 +1822,17 @@ class CompressionPipeline:
             quality_gates: Optional QualityGates instance.
             enable_gate1: Whether to enable Gate 1 (faithfulness).
             enable_gate2: Whether to enable Gate 2 (feedback loop).
+            use_real_cli: Use real Claude Code CLI for Phase 2 validation.
+            cli_path: Path to Claude Code CLI executable.
+            cli_timeout: Timeout in seconds for CLI subprocess calls.
         """
         self.llm_client = llm_client
-        self.stage1_optimizer = stage1_optimizer or Stage1Optimizer(llm_client)
+        self.stage1_optimizer = stage1_optimizer or Stage1Optimizer(
+            llm_client,
+            use_real_cli=use_real_cli,
+            cli_path=cli_path,
+            cli_timeout=cli_timeout
+        )
         self.stage2_optimizer = stage2_optimizer or Stage2Optimizer(llm_client)
         self.quality_gates = quality_gates or QualityGates(llm_client)
         self.enable_gate1 = enable_gate1
@@ -1840,8 +1931,30 @@ class CompressionPipeline:
             # Gate 1: Faithfulness Verification (Fine-grained Rollback)
             # ============================================================
             if self.enable_gate1 and stage2_compressed:
+                # Per paper Eq. 3: include reference modules so concepts
+                # moved to on-demand modules by progressive disclosure
+                # are correctly counted as preserved, not missing.
+                ref_modules_for_gate1 = None
+                if on_demand_modules is not None:
+                    ref_modules_for_gate1 = {}
+                    if on_demand_modules.examples:
+                        ref_modules_for_gate1["on-demand-examples.md"] = "\n".join(
+                            b.content for b in on_demand_modules.examples
+                        )
+                    if on_demand_modules.templates:
+                        ref_modules_for_gate1["on-demand-templates.md"] = "\n".join(
+                            b.content for b in on_demand_modules.templates
+                        )
+                    if on_demand_modules.background:
+                        ref_modules_for_gate1["on-demand-background.md"] = "\n".join(
+                            b.content for b in on_demand_modules.background
+                        )
+                    if not ref_modules_for_gate1:
+                        ref_modules_for_gate1 = None
+
                 faithfulness_result = self.quality_gates.run_faithfulness_gate(
-                    skill, final_blocks
+                    skill, final_blocks,
+                    reference_modules=ref_modules_for_gate1
                 )
 
                 if faithfulness_result.should_rollback:
@@ -1957,7 +2070,8 @@ class CompressionPipeline:
                     skill=skill,
                     initial_blocks=final_blocks,
                     stage2_optimizer=self.stage2_optimizer,
-                    max_iterations=2
+                    max_iterations=2,
+                    original_blocks=original_blocks
                 )
 
                 if gate2_result.promoted_blocks:
@@ -2015,7 +2129,10 @@ def run_pipeline(
     llm_client,
     enable_gate1: bool = True,
     enable_gate2: bool = True,
-    failed_criteria: Optional[list[str]] = None
+    failed_criteria: Optional[list[str]] = None,
+    use_real_cli: bool = False,
+    cli_path: str = "claude",
+    cli_timeout: int = 60
 ) -> PipelineResult:
     """
     Convenience function to run the complete compression pipeline.
@@ -2026,6 +2143,9 @@ def run_pipeline(
         enable_gate1: Whether to enable Gate 1.
         enable_gate2: Whether to enable Gate 2.
         failed_criteria: Optional failed criteria for Gate 2 (deprecated - auto-generated now).
+        use_real_cli: Use real Claude Code CLI for Phase 2 validation.
+        cli_path: Path to Claude Code CLI executable.
+        cli_timeout: Timeout in seconds for CLI subprocess calls.
 
     Returns:
         PipelineResult with complete compression results.
@@ -2033,6 +2153,9 @@ def run_pipeline(
     pipeline = CompressionPipeline(
         llm_client=llm_client,
         enable_gate1=enable_gate1,
-        enable_gate2=enable_gate2
+        enable_gate2=enable_gate2,
+        use_real_cli=use_real_cli,
+        cli_path=cli_path,
+        cli_timeout=cli_timeout
     )
     return pipeline.run_pipeline(skill, failed_criteria=failed_criteria)

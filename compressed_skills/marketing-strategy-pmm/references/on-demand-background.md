@@ -1,0 +1,8 @@
+<!--
+WHEN: Load this when user asks about product positioning, ideal customer profiles, go-to-market strategy, competitive intelligence, or product launch planning.
+TOPICS: product positioning, ideal customer profile, go-to-market strategy, competitive intelligence, product launch
+-->
+
+## Background 1
+
+Product marketing patterns cover positioning, GTM strategy, and competitive intelligence, with reference documentation in files such as `references/positioning-frameworks.md`, `references/launch-checklists.md`, `references/international-gtm.md`, and `references/messaging-templates.md`. In scope includes product positioning using the April Dunford methodology, ICP definition and validation, competitive intelligence and battlecards, GTM strategy and motion selection (PLG, sales-led, marketing-led, community-led), product launch planning, sales enablement, win/loss analysis, international expansion planning, messaging hierarchy, and PMM KPIs. Out of scope are brand identity and visual design, demand generation execution, content creation, pricing strategy optimization, and sales process design. Limitations: positioning frameworks require real customer input; internally generated positioning is unreliable. Win/loss analysis requires honest deal outcome data from sales; incomplete data produces misleading patterns. GTM motion recommendations are based on ACV and buyer type heuristics; edge cases may require hybrid approaches. International expansion timelines assume US-first model and may not apply to non-US companies.

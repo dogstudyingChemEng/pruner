@@ -10,7 +10,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 from .chunker import chunk_markdown_body, count_tokens
-from .llm_client import BlockClassificationResult, SkillLLMClient
+from .llm_client import BlockClassification, BlockClassificationResult, SkillLLMClient
 from .models import ContentBlock, ContentType, Skill, References, OnDemandModules, RoutingMetadata
 
 
@@ -119,6 +119,14 @@ class Stage2Optimizer:
             if block.chunk_id in classification_map:
                 block.content_type = classification_map[block.chunk_id]
 
+        # Step 4: Cross-validation pass (per paper Section III-B)
+        # Re-evaluate each block's label in context of its neighbors (up to 2 rounds)
+        content_blocks = self.cross_validate_classifications(
+            blocks=content_blocks,
+            skill_context=skill_context,
+            max_rounds=2
+        )
+
         return content_blocks
 
     def _classify_in_batches(
@@ -151,15 +159,190 @@ class Stage2Optimizer:
                 for block in batch
             ]
 
-            # Call LLM for classification
-            result = self.llm_client.classify_content_blocks(
-                content_chunks=chunks_for_llm,
-                skill_context=skill_context
-            )
-
-            all_classifications.extend(result.classifications)
+            # Call LLM for classification (with fallback to core_rule per paper)
+            try:
+                result = self.llm_client.classify_content_blocks(
+                    content_chunks=chunks_for_llm,
+                    skill_context=skill_context
+                )
+                all_classifications.extend(result.classifications)
+            except Exception:
+                # Per paper: "If the LLM fails to produce a valid classification
+                # after three retries, the item defaults to core rule as a
+                # conservative fallback."
+                for chunk in chunks_for_llm:
+                    all_classifications.append(BlockClassification(
+                        chunk_id=chunk["chunk_id"],
+                        content_type=ContentType.CORE_RULE,
+                        reasoning="Fallback: classification failed after retries"
+                    ))
 
         return BlockClassificationResult(classifications=all_classifications)
+
+    # ============================================================
+    # Cross-Validation (Paper Section III-B)
+    # ============================================================
+
+    def cross_validate_classifications(
+        self,
+        blocks: list[ContentBlock],
+        skill_context: str,
+        max_rounds: int = 2
+    ) -> list[ContentBlock]:
+        """
+        Cross-validation pass: re-evaluate each block's label in context of neighbors.
+
+        Per SkillReducer paper Section III-B: "a cross-validation pass where each
+        item's label is re-evaluated in context of its neighbors' labels (up to
+        2 rounds)."
+
+        This catches classification errors before they propagate into compression
+        and quality gates. The process stops early if no labels change in a round.
+
+        Args:
+            blocks: Classified content blocks from the initial LLM pass.
+            skill_context: Context about the skill (name + description).
+            max_rounds: Maximum cross-validation rounds (default 2 per paper).
+
+        Returns:
+            List of ContentBlock objects with potentially corrected classifications.
+        """
+        if len(blocks) <= 1:
+            return blocks
+
+        for round_num in range(max_rounds):
+            changes_made = 0
+            new_blocks = list(blocks)
+
+            for i, block in enumerate(blocks):
+                # Build neighbor context
+                neighbor_parts = []
+                if i > 0:
+                    prev = blocks[i - 1]
+                    prev_type = prev.content_type if isinstance(prev.content_type, str) else prev.content_type.value
+                    neighbor_parts.append(
+                        f"[Previous block — type: {prev_type}]\n{prev.content[:300]}"
+                    )
+                if i < len(blocks) - 1:
+                    nxt = blocks[i + 1]
+                    nxt_type = nxt.content_type if isinstance(nxt.content_type, str) else nxt.content_type.value
+                    neighbor_parts.append(
+                        f"[Next block — type: {nxt_type}]\n{nxt.content[:300]}"
+                    )
+
+                if not neighbor_parts:
+                    continue
+
+                neighbor_context = "\n\n".join(neighbor_parts)
+
+                current_type = block.content_type if isinstance(block.content_type, str) else block.content_type.value
+                new_type = self._cross_validate_single_block(
+                    block=block,
+                    current_type=current_type,
+                    neighbor_context=neighbor_context,
+                    skill_context=skill_context
+                )
+
+                if new_type and new_type != block.content_type:
+                    new_blocks[i] = ContentBlock(
+                        chunk_id=block.chunk_id,
+                        content=block.content,
+                        content_type=new_type,
+                        token_count=block.token_count
+                    )
+                    changes_made += 1
+
+            blocks = new_blocks
+            if changes_made == 0:
+                break  # Converged — no labels changed in this round
+
+        return blocks
+
+    def _cross_validate_single_block(
+        self,
+        block: ContentBlock,
+        current_type: str,
+        neighbor_context: str,
+        skill_context: str
+    ) -> Optional[ContentType]:
+        """
+        Re-evaluate a single block's classification in context of its neighbors.
+
+        Args:
+            block: The content block to re-evaluate.
+            current_type: Current classification type string.
+            neighbor_context: Formatted text showing neighbor blocks and their types.
+            skill_context: Context about the skill.
+
+        Returns:
+            New ContentType if reclassification is needed, None if no change.
+        """
+        system_prompt = """You are a content classification expert performing cross-validation.
+
+Your task: re-evaluate a single content block's classification given the classifications of its neighboring blocks.
+
+Content types:
+- core_rule: Actionable instructions, rules, workflows, steps the agent must follow
+- background: Explanations, definitions, rationale, conceptual context
+- example: Code snippets, usage demonstrations, sample I/O
+- template: Boilerplate, fill-in-the-blank structures, reusable patterns
+- redundant: Duplicated or no-value content
+
+Cross-validation guidelines:
+1. The block's type should be CONSISTENT with neighbors — if both neighbors are core_rule and this block looks actionable, it should likely also be core_rule
+2. Type TRANSITIONS make sense at heading/document boundaries — background after core_rule explanation is normal
+3. Only change the classification if the neighbor context provides STRONG evidence the current type is wrong
+4. When in doubt between core_rule and background, prefer core_rule (conservative)
+
+IMPORTANT: Respond with a JSON object:
+{
+  "corrected_type": "core_rule|background|example|template|redundant",
+  "changed": true,
+  "reasoning": "Why the type should be changed, or why it stays the same"
+}
+
+Return "changed": false if the current classification is correct."""
+
+        user_prompt = f"""Skill Context: {skill_context}
+
+CURRENT BLOCK (type: {current_type}):
+{block.content[:500]}
+
+NEIGHBORING BLOCKS:
+{neighbor_context}
+
+Re-evaluate the CURRENT BLOCK's classification in context of its neighbors. Is the current type "{current_type}" correct?"""
+
+        try:
+            response = self.llm_client.client.chat.completions.create(
+                model=self.llm_client.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            if result.get("changed", False):
+                corrected = result.get("corrected_type", current_type)
+                # Map string back to ContentType enum
+                type_map = {
+                    "core_rule": ContentType.CORE_RULE,
+                    "background": ContentType.BACKGROUND,
+                    "example": ContentType.EXAMPLE,
+                    "template": ContentType.TEMPLATE,
+                    "redundant": ContentType.REDUNDANT,
+                }
+                return type_map.get(corrected, None)
+
+            return None
+
+        except Exception:
+            # On failure, keep current classification (conservative)
+            return None
 
     # ============================================================
     # Compression Methods (Post-processing)
@@ -532,21 +715,93 @@ CRITICAL: Preserve all numbers, thresholds, API endpoints, and specific values e
             token_count=summary_tokens
         )], len(background_blocks) - 1
 
+    def _compress_reference(self, content: str) -> str:
+        """
+        Compress deduplicated reference content (Algorithm 2 line 11: COMPRESS(r')).
+
+        After removing overlap with the body, remaining unique content is
+        compressed to remove verbosity while preserving all factual information.
+        Per paper: "compresses the remaining unique content."
+
+        Args:
+            content: Deduplicated reference content.
+
+        Returns:
+            Compressed reference content.
+        """
+        if not content or not content.strip():
+            return content
+
+        original_tokens = count_tokens(content)
+        if original_tokens < 60:
+            # Content too short to benefit from compression
+            return content
+
+        system_prompt = """You are an expert at compressing technical reference documentation.
+
+Your task is to compress reference content while preserving ALL essential information.
+
+CRITICAL REQUIREMENTS:
+- Preserve ALL specific facts: numbers, thresholds, API endpoints, URLs,
+  version numbers, configuration values, command names, flags, code snippets
+- Remove redundancy, verbose explanations, and filler text
+- Keep the document structure readable
+- The compressed version MUST be strictly shorter than the original
+- Do NOT remove any unique information not present elsewhere
+
+IMPORTANT: Respond with a JSON object:
+{
+  "compressed_content": "The compressed reference content",
+  "compression_ratio": 0.25
+}"""
+
+        user_prompt = f"""Compress the following reference content while preserving ALL unique factual information:
+
+{content[:6000]}
+
+Original tokens: {original_tokens}
+The compressed version MUST have fewer tokens than the original."""
+
+        try:
+            response = self.llm_client.client.chat.completions.create(
+                model=self.llm_client.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            compressed = result.get("compressed_content", content)
+
+            # Only use if actually shorter
+            compressed_tokens = count_tokens(compressed)
+            if compressed_tokens < original_tokens:
+                return compressed
+            return content
+
+        except Exception:
+            return content
+
     def dedup_references(
         self,
-        body_blocks: list[ContentBlock],
+        body_text: str,
         references: References,
         min_token_threshold: int = 30
     ) -> tuple[References, int, int]:
         """
         Cross-file deduplication between body and references.
 
-        Detects and removes content in references that duplicates rules
-        already present in the body. Discards reference files that end
-        up with fewer than min_token_threshold tokens.
+        Detects and removes content in references that duplicates content
+        already present in the full original skill body (per paper, dedup
+        against the full original body s.b). Compresses remaining unique
+        content per Algorithm 2 line 11 (COMPRESS(r')). Discards reference
+        files that end up with fewer than min_token_threshold tokens.
 
         Args:
-            body_blocks: Content blocks from the skill body.
+            body_text: Full original skill body text to dedup against.
             references: Reference files to deduplicate.
             min_token_threshold: Minimum tokens to keep a reference file.
 
@@ -556,13 +811,7 @@ CRITICAL: Preserve all numbers, thresholds, API endpoints, and specific values e
         if not references.files:
             return references, 0, 0
 
-        # Extract core rules and key concepts from body
-        core_rules_text = "\n".join([
-            b.content for b in body_blocks
-            if b.content_type == ContentType.CORE_RULE
-        ])
-
-        if not core_rules_text:
+        if not body_text or not body_text.strip():
             return references, 0, 0
 
         new_files = {}
@@ -573,7 +822,7 @@ CRITICAL: Preserve all numbers, thresholds, API endpoints, and specific values e
             system_prompt = """You are an expert at detecting duplicate content in technical documentation.
 
 Your task is to analyze a reference file and remove any content that duplicates
-information already present in the main skill body rules.
+information already present in the main skill body.
 
 Guidelines:
 - Remove paragraphs/sections that convey the same rules or information
@@ -588,13 +837,18 @@ IMPORTANT: Respond with a JSON object:
   "unique_content_preserved": true
 }"""
 
-            user_prompt = f"""Main Body Rules (already present):
-{core_rules_text[:3000]}  # Limit to avoid context overflow
+            # Per paper: dedup against "the full original body s.b" (Section IV-B)
+            # Truncate only at a high limit to prevent extreme context overflow,
+            # but preserve as much body content as possible for accurate dedup
+            body_for_dedup = body_text[:12000]
+
+            user_prompt = f"""Main Body Content (already present):
+{body_for_dedup}
 
 Reference File Content:
 {content}
 
-Remove any content from the reference that duplicates the main body rules.
+Remove any content from the reference that duplicates the main body content.
 Keep only unique, additional information."""
 
             response = self.llm_client.client.chat.completions.create(
@@ -613,13 +867,17 @@ Keep only unique, additional information."""
             deduped_content = result.get("deduplicated_content", content)
             duplicates_removed = result.get("duplicates_removed", 0)
 
+            # Per Algorithm 2 line 11: Add COMPRESS(r') to R*
+            # Compress the remaining unique content after dedup
+            compressed_content = self._compress_reference(deduped_content)
+
             # Check if remaining content meets threshold
-            remaining_tokens = count_tokens(deduped_content)
+            remaining_tokens = count_tokens(compressed_content)
 
             if remaining_tokens < min_token_threshold:
                 files_discarded += 1
             else:
-                new_files[filename] = deduped_content
+                new_files[filename] = compressed_content
                 total_deduped += duplicates_removed
 
         new_references = References(
@@ -849,11 +1107,11 @@ Generate routing metadata for this on-demand module."""
         )
 
         # Step 6: Cross-file deduplication with existing references
-        # Note: We dedupe against CORE RULES only, not on-demand modules
+        # Per paper: dedup against full original body s.b
         updated_references = skill.references
         if dedup_references and skill.references.files:
             updated_references, ref_blocks_deduped, ref_files_discarded = self.dedup_references(
-                core_blocks, skill.references  # Only core blocks for dedup
+                skill.body.original, skill.references
             )
 
         # Step 7: Generate routing metadata for on-demand modules

@@ -123,7 +123,7 @@ class SkillLLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.1,
+            temperature=0.0,
             response_format={"type": "json_object"}
         )
 

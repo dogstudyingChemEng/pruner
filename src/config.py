@@ -92,7 +92,7 @@ class SkillReducerConfig(BaseModel):
         description="Enable three-condition evaluation (D/A/C) for Gate 2"
     )
     retention_threshold: float = Field(
-        default=0.86,
+        default=1.0,
         description="Minimum retention threshold (score_C / score_A)"
     )
     enable_read_file_tool: bool = Field(
@@ -123,6 +123,25 @@ class SkillReducerConfig(BaseModel):
     pytest_timeout: int = Field(
         default=30,
         description="Timeout in seconds for pytest execution"
+    )
+
+    # ============================================================
+    # Model Separation (Paper Section V-A)
+    # ============================================================
+
+    evaluator_model: str = Field(
+        default="",
+        description="Separate model for evaluation. Per paper, compression and "
+                    "evaluation use different models to prevent information leakage. "
+                    "Leave empty to use the same model (warning will be logged)."
+    )
+    evaluator_api_key: str = Field(
+        default="",
+        description="API key for evaluator model. Uses OPENAI_API_KEY if empty."
+    )
+    evaluator_base_url: str = Field(
+        default="",
+        description="Base URL for evaluator model API. Uses OPENAI_BASE_URL if empty."
     )
 
     # ============================================================
@@ -189,6 +208,10 @@ def get_paper_config() -> SkillReducerConfig:
     - Three-condition evaluation
     - Hybrid scoring
     - read_file tool simulation
+
+    Note: Per paper Section V-A, compression (DeepSeek-V3) and evaluation
+    (Qwen3.5) should use separate models to prevent information leakage.
+    Set evaluator_model and evaluator_api_key accordingly.
     """
     return SkillReducerConfig(
         use_real_cli=True,

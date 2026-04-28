@@ -612,7 +612,7 @@ class TestStage2CompressionMethods:
         )
 
         new_refs, deduped, discarded = optimizer.dedup_references(
-            body_blocks, references, min_token_threshold=10
+            "Core rule 1: Do this.\nCore rule 2: Do that.", references, min_token_threshold=10
         )
 
         assert deduped == 2
@@ -651,7 +651,7 @@ class TestStage2CompressionMethods:
         )
 
         new_refs, deduped, discarded = optimizer.dedup_references(
-            body_blocks, references, min_token_threshold=30
+            "Core rule content", references, min_token_threshold=30
         )
 
         # File should be discarded because remaining content < 30 tokens
@@ -674,7 +674,7 @@ class TestStage2CompressionMethods:
 
         references = References()
 
-        new_refs, deduped, discarded = optimizer.dedup_references(body_blocks, references)
+        new_refs, deduped, discarded = optimizer.dedup_references("Content", references)
 
         assert deduped == 0
         assert discarded == 0
@@ -702,7 +702,7 @@ class TestFullOptimizationPipeline:
         """Test full optimization pipeline with all steps."""
         mock_client = self._create_mock_llm_client()
 
-        # Set up mocks for each step
+        # Set up mocks for each step (cross-validation happens before compression)
         responses = iter([
             # Classification
             json.dumps({
@@ -712,6 +712,12 @@ class TestFullOptimizationPipeline:
                     {"chunk_id": "chunk_3", "content_type": "background", "reasoning": "test"}
                 ]
             }),
+            # Cross-validation: block 1 (core_rule, no change)
+            json.dumps({"changed": False, "corrected_type": "core_rule", "reasoning": "correct"}),
+            # Cross-validation: block 2 (example, no change)
+            json.dumps({"changed": False, "corrected_type": "example", "reasoning": "correct"}),
+            # Cross-validation: block 3 (background, no change)
+            json.dumps({"changed": False, "corrected_type": "background", "reasoning": "correct"}),
             # Compress core
             json.dumps({
                 "compressed_rules": ["• Rule 1: Do this"],

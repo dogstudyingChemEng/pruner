@@ -229,7 +229,10 @@ class Stage1Optimizer:
         self,
         llm_client: SkillLLMClient,
         oracle_model: Optional[str] = None,
-        skill_library_path: str = "Claude-Skills"
+        skill_library_path: str = "Claude-Skills",
+        use_real_cli: bool = False,
+        cli_path: str = "claude",
+        cli_timeout: int = 60
     ):
         """
         Initialize the Stage 1 optimizer.
@@ -238,10 +241,17 @@ class Stage1Optimizer:
             llm_client: LLM client for segmentation and oracle testing.
             oracle_model: Model to use for oracle (defaults to client's model).
             skill_library_path: Path to skill library for TF-IDF distractor selection.
+            use_real_cli: Use real Claude Code CLI for Phase 2 validation (paper default: True).
+            cli_path: Path to Claude Code CLI executable.
+            cli_timeout: Timeout in seconds for CLI subprocess calls.
         """
         self.llm_client = llm_client
         self.oracle_model = oracle_model or llm_client.model
         self.tfidf_index = SkillLibraryTFIDF(skill_library_path)
+        self.use_real_cli = use_real_cli
+        self.cli_path = cli_path
+        self.cli_timeout = cli_timeout
+        self._cli_validator = None  # Lazy init
 
     # ============================================================
     # Pre-generation for missing/short descriptions
@@ -251,17 +261,23 @@ class Stage1Optimizer:
         self,
         skill: Skill,
         min_tokens: int = 40,
-        enable_structured: bool = False
+        enable_structured: bool = False,
+        validate_with_oracle: bool = True,
+        max_retries: int = 3
     ) -> Skill:
         """
         Ensure skill has a valid description with minimum tokens.
 
         For missing or too-short descriptions, generates one from body.
+        Per paper: "The generated description is validated through Phase 1's
+        simulated oracle before acceptance."
 
         Args:
             skill: The skill to check/update.
             min_tokens: Minimum token count required.
             enable_structured: Generate structured routing signals per paper methodology.
+            validate_with_oracle: Validate generated description via simulated oracle.
+            max_retries: Maximum generation retries if validation fails.
 
         Returns:
             Updated Skill with valid description.
@@ -269,21 +285,57 @@ class Stage1Optimizer:
         current_desc = skill.description.original
         current_tokens = count_tokens(current_desc) if current_desc else 0
 
-        if current_desc and current_tokens >= min_tokens:
+        if current_desc and current_tokens > min_tokens:
             return skill
 
-        # Generate description from body
-        if enable_structured:
-            structured_desc = self.generate_structured_description(skill)
-            if structured_desc:
-                skill.description.structured = structured_desc
-                skill.description.original = structured_desc.combined_description
-                skill.description.original_token_count = structured_desc.total_tokens
-        else:
-            generated_desc = self._generate_description_from_body(skill)
-            if generated_desc:
-                skill.description.original = generated_desc
-                skill.description.original_token_count = count_tokens(generated_desc)
+        # Generate description from body (with retries and oracle validation)
+        for attempt in range(max_retries):
+            if enable_structured:
+                structured_desc = self.generate_structured_description(skill)
+                if structured_desc:
+                    generated_desc = structured_desc.combined_description
+                else:
+                    generated_desc = None
+            else:
+                generated_desc = self._generate_description_from_body(skill)
+
+            if not generated_desc:
+                return skill
+
+            # Per paper: validate generated description through simulated oracle before acceptance
+            if validate_with_oracle:
+                # Get distractors for oracle validation
+                try:
+                    distractors = self.get_distractors(skill, num_real=4, num_adversarial=1)
+                    # Temporarily set the generated description for oracle testing
+                    temp_skill = skill.model_copy(deep=True)
+                    temp_skill.description.original = generated_desc
+                    temp_skill.description.original_token_count = count_tokens(generated_desc)
+
+                    result = self.test_routing(
+                        compressed_description=generated_desc,
+                        target_skill=temp_skill,
+                        distractors=distractors
+                    )
+                    if result.success:
+                        # Oracle validates: accept the generated description
+                        break
+                    # Oracle rejects: retry generation
+                except Exception:
+                    # Oracle validation failed due to error - accept the description anyway
+                    break
+            else:
+                break
+        # After all retries, use the last generated description (even if oracle rejected it,
+        # as it's better than no description)
+
+        if enable_structured and generated_desc:
+            skill.description.structured = structured_desc
+            skill.description.original = structured_desc.combined_description
+            skill.description.original_token_count = structured_desc.total_tokens
+        elif generated_desc:
+            skill.description.original = generated_desc
+            skill.description.original_token_count = count_tokens(generated_desc)
 
         return skill
 
@@ -820,122 +872,225 @@ Generate a realistic user query that would need this skill."""
         """
         Delta Debugging (DDMIN) algorithm for 1-minimal subset.
 
-        Recursively divides clauses and tests subsets to find the minimal
-        set that still passes the routing test.
+        Canonical implementation from Zeller & Hildebrandt (2002):
+        Phase 1 — Complement testing: try removing each subset.
+        Phase 2 — Subset testing: test each subset alone.
+
+        Iteratively refines until no further reduction is possible,
+        yielding a 1-minimal set where every clause is individually
+        necessary.
 
         Args:
             clauses: List of semantic clauses.
             test_func: Function that takes a list of clauses and returns bool (pass/fail).
-            n: Number of subsets to divide into (default 2 for binary split).
+            n: Initial number of subsets (default 2 for binary split).
 
         Returns:
             1-minimal subset of clauses that passes the test.
         """
-        if len(clauses) <= 1:
-            return clauses
+        current = list(clauses)
+        if len(current) <= 1:
+            return current
 
-        # Split into n subsets
-        subset_size = max(1, len(clauses) // n)
-        subsets = []
-        for i in range(0, len(clauses), subset_size):
-            subsets.append(clauses[i:i + subset_size])
+        n = 2
+        while len(current) >= 2:
+            # Split current set into n roughly equal subsets
+            subset_size = max(1, len(current) // n)
+            subsets = []
+            for i in range(0, len(current), subset_size):
+                subsets.append(current[i:i + subset_size])
 
-        # Try removing each subset
-        for i, subset_to_remove in enumerate(subsets):
-            # Create complement (all clauses except the subset to remove)
-            complement = []
-            for j, subset in enumerate(subsets):
-                if j != i:
-                    complement.extend(subset)
+            found = False
 
-            if not complement:
-                continue
+            # Phase 1: Complement testing — try deleting each subset
+            for i, subset_to_remove in enumerate(subsets):
+                complement = []
+                for j, subset in enumerate(subsets):
+                    if j != i:
+                        complement.extend(subset)
+                if not complement:
+                    continue
+                if test_func(complement):
+                    # Complement passes — reduce to complement,
+                    # decrease granularity for finer search
+                    current = complement
+                    n = max(n - 1, 2)
+                    found = True
+                    break
 
-            # Test if complement still passes
-            if test_func(complement):
-                # Complement passes, continue DDMIN on complement
-                return self.ddmin(complement, test_func, n)
+            if not found:
+                # Phase 2: Subset testing — test each subset alone
+                if n < len(current):
+                    for subset in subsets:
+                        if test_func(subset):
+                            # Subset alone is sufficient — reset to
+                            # this subset, reset granularity
+                            current = subset
+                            n = 2
+                            found = True
+                            break
 
-        # No subset can be removed, try increasing granularity
-        if n < len(clauses):
-            return self.ddmin(clauses, test_func, min(n * 2, len(clauses)))
+            if not found:
+                # Neither phase reduced the set — increase granularity
+                if n < len(current):
+                    n = min(n * 2, len(current))
+                else:
+                    # At maximum granularity with no reduction possible:
+                    # current is 1-minimal
+                    break
 
-        # Already at max granularity, return current set
-        return clauses
+        return current
 
     # ============================================================
     # Phase 2: Real-world Validation with Selective Restore
     # ============================================================
 
+    def _get_cli_validator(self):
+        """Lazy-init the CLI validator for Phase 2 real-environment validation."""
+        if self._cli_validator is None:
+            from .cli_validator import RealTriggerValidator
+            self._cli_validator = RealTriggerValidator(
+                cli_path=self.cli_path,
+                timeout=self.cli_timeout
+            )
+        return self._cli_validator
+
     def phase2_validate_with_restore(
         self,
-        minimal_clauses: list[SemanticClause],
+        d_fast: str,
+        paraphrased_clauses: list[SemanticClause],
         original_clauses: list[SemanticClause],
         skill: Skill,
         distractors: list[dict],
         num_queries: int = 5,
         max_restore_steps: int = 3
-    ) -> tuple[list[SemanticClause], bool]:
+    ) -> tuple[str, bool]:
         """
         Phase 2: Real-world validation with selective restore.
 
-        Tests the minimal clauses with multiple diverse queries.
-        If routing fails, selectively restores clauses that address the failure.
-
-        Per SkillReducer paper Algorithm 1 (lines 12-18): maximum of three restore steps.
+        Per SkillReducer paper Algorithm 1 (lines 7-19):
+        1. Establish Qval: queries that trigger with the original description
+        2. Test d_fast (polished compressed description) against all Qval
+        3. If all pass, return d_fast immediately
+        4. Deleted units D = U minus U* (original clauses not in DDMIN result)
+        5. For each restore step (max 3): try each deleted unit individually
+           with the paraphrased clause set, greedily add the best unit
+        6. If all Qval trigger after a restore step, return JOIN(U*)
+        7. If max steps reached, return current best (caller falls back to original)
 
         Args:
-            minimal_clauses: The 1-minimal clause subset from Phase 1.
-            original_clauses: All original clauses before reduction.
+            d_fast: POLISH(JOIN(paraphrased_clauses)) — the polished candidate.
+            paraphrased_clauses: Current U* after DDMIN + paraphrase.
+            original_clauses: All original clauses from SEGMENT (before DDMIN).
             skill: The target skill.
             distractors: Distractor skills for routing test.
             num_queries: Number of diverse test queries to use.
             max_restore_steps: Maximum restore iterations (default 3 per paper).
 
         Returns:
-            Tuple of (final_clauses, all_tests_passed).
+            Tuple of (final_description, passed).
+            - If d_fast passes: (d_fast, True)
+            - If selective restore succeeds: (JOIN(restored_clauses), True)
+            - If all fails: (best_description, False) — caller falls back to original
         """
-        current_clauses = list(minimal_clauses)
-        removed_clauses = [c for c in original_clauses if c not in minimal_clauses]
-
         # Generate diverse test queries
         queries = self._generate_diverse_queries(skill, num_queries)
 
-        all_passed = True
-        restore_count = 0
+        # Compute D = U \ U* (original deleted clauses, not paraphrased)
+        # Use clause_id for comparison since paraphrasing changes content text
+        retained_ids = {c.clause_id for c in paraphrased_clauses}
+        deleted_clauses = [c for c in original_clauses if c.clause_id not in retained_ids]
 
-        for query in queries:
-            # Stop if max restore steps reached per paper
-            if restore_count >= max_restore_steps:
+        if self.use_real_cli:
+            cli = self._get_cli_validator()
+
+            # Build original description for Qval baseline
+            original_desc = " ".join(c.content for c in original_clauses)
+
+            # Paper line 7: Qval ← {q ∈ Q | REALTRIGGER(q, s.d) = 1}
+            Qval = []
+            for q in queries:
+                result = cli.validate_trigger(
+                    skill_name=skill.name,
+                    compressed_description=original_desc,
+                    query=q,
+                    skill_content=skill.body.original[:2000] if skill.body.original else None
+                )
+                if result.triggered:
+                    Qval.append(q)
+
+            if not Qval:
+                return d_fast, False
+
+            def _test_description(desc: str) -> float:
+                """Test a description string (d_fast or JOIN) against Qval via REALTRIGGER."""
+                triggered = 0
+                for q in Qval:
+                    result = cli.validate_trigger(
+                        skill_name=skill.name,
+                        compressed_description=desc,
+                        query=q,
+                        skill_content=skill.body.original[:2000] if skill.body.original else None
+                    )
+                    if result.triggered:
+                        triggered += 1
+                return triggered / len(Qval)
+        else:
+            Qval = list(queries)
+
+            def _test_description(desc: str) -> float:
+                """Test a description string against Qval via simulated oracle."""
+                triggered = 0
+                for q in Qval:
+                    result = self.test_routing(
+                        compressed_description=desc,
+                        target_skill=skill,
+                        distractors=distractors,
+                        query=q
+                    )
+                    if result.success:
+                        triggered += 1
+                return triggered / len(Qval)
+
+        # Per Algorithm 1 line 8: test if d_fast passes all Qval queries
+        if _test_description(d_fast) == 1.0:
+            return d_fast, True
+
+        # Per Algorithm 1 lines 12-18: greedy selective restore (max 3 steps)
+        current_clauses = list(paraphrased_clauses)
+
+        for _ in range(max_restore_steps):
+            if not deleted_clauses:
                 break
 
-            temp_description = " ".join(c.content for c in current_clauses)
-            result = self.test_routing(
-                compressed_description=temp_description,
-                target_skill=skill,
-                distractors=distractors,
-                query=query
+            # Try each deleted unit, pick the one that maximizes trigger rate
+            best_unit: Optional[SemanticClause] = None
+            best_rate = _test_description(
+                " ".join(c.content for c in current_clauses)
             )
 
-            if not result.success:
-                all_passed = False
-                # Selective restore: find which removed clause would help
-                restored = self._selective_restore(
-                    current_clauses=current_clauses,
-                    removed_clauses=removed_clauses,
-                    skill=skill,
-                    distractors=distractors,
-                    failed_query=query
+            for unit in deleted_clauses:
+                test_desc = " ".join(
+                    c.content for c in (current_clauses + [unit])
                 )
+                rate = _test_description(test_desc)
+                if rate > best_rate:
+                    best_rate = rate
+                    best_unit = unit
 
-                if restored:
-                    current_clauses.extend(restored)
-                    # Remove restored from available removed_clauses
-                    restored_ids = {c.clause_id for c in restored}
-                    removed_clauses = [c for c in removed_clauses if c.clause_id not in restored_ids]
-                    restore_count += 1
+            if best_unit is None:
+                break
 
-        return current_clauses, all_passed
+            current_clauses.append(best_unit)
+            deleted_clauses.remove(best_unit)
+
+            # Per Algorithm 1 line 15: if all Qval trigger, return JOIN(U*)
+            if best_rate == 1.0:
+                return " ".join(c.content for c in current_clauses), True
+
+        # Per Algorithm 1 line 19: restore failed
+        best_desc = " ".join(c.content for c in current_clauses)
+        return best_desc, False
 
     def _generate_diverse_queries(self, skill: Skill, num_queries: int) -> list[str]:
         """Generate diverse test queries for Phase 2 validation."""
@@ -975,78 +1130,129 @@ Generate {num_queries} diverse user queries for this skill."""
 
         return result_dict.get("queries", [f"Help me with {skill.name}"] * num_queries)
 
-    def _selective_restore(
+    def _paraphrase_clauses(
         self,
-        current_clauses: list[SemanticClause],
-        removed_clauses: list[SemanticClause],
-        skill: Skill,
+        clauses: list[SemanticClause],
+        target_skill: Skill,
         distractors: list[dict],
-        failed_query: str
+        queries: Optional[list[str]] = None
     ) -> list[SemanticClause]:
         """
-        Selectively restore clauses that address routing failure.
+        Try shorter paraphrase for each clause, keeping if oracle passes.
 
-        Uses LLM to identify which removed clauses are most relevant
-        to the failed query.
+        Per Algorithm 1 (lines 3-5): For each ui in U*, try a shorter
+        paraphrase; keep if O_sim passes, otherwise keep the original.
+
+        Uses the same fixed query set as DDMIN for oracle consistency.
 
         Args:
-            current_clauses: Current clause set.
-            removed_clauses: Clauses that were removed.
-            skill: The target skill.
-            distractors: Distractor skills.
-            failed_query: The query that caused routing failure.
+            clauses: The minimal clause subset from DDMIN.
+            target_skill: The target skill for oracle testing.
+            distractors: Distractor skills for oracle testing.
+            queries: Fixed query set for oracle testing (same as DDMIN queries).
 
         Returns:
-            List of clauses to restore.
+            List of clauses with shorter paraphrases where oracle passes.
         """
-        if not removed_clauses:
-            return []
+        paraphrased = []
+        for clause in clauses:
+            shorter = self._try_paraphrase_clause(clause)
+            if shorter and shorter != clause.content:
+                # Build test description: replace this clause with paraphrase
+                remaining = [c for c in clauses if c.clause_id != clause.clause_id]
+                test_desc = " ".join([shorter] + [c.content for c in remaining])
 
-        system_prompt = """You are an expert at analyzing routing failures.
+                # Per paper: keep if O_sim passes for ALL queries
+                if queries:
+                    passed = True
+                    for q in queries:
+                        result = self.test_routing(
+                            compressed_description=test_desc,
+                            target_skill=target_skill,
+                            distractors=distractors,
+                            query=q
+                        )
+                        if not result.success:
+                            passed = False
+                            break
+                    if passed:
+                        paraphrased.append(SemanticClause(
+                            clause_id=clause.clause_id,
+                            content=shorter
+                        ))
+                    else:
+                        paraphrased.append(clause)
+                else:
+                    # Fallback: single random query (less strict)
+                    result = self.test_routing(
+                        compressed_description=test_desc,
+                        target_skill=target_skill,
+                        distractors=distractors
+                    )
+                    if result.success:
+                        paraphrased.append(SemanticClause(
+                            clause_id=clause.clause_id,
+                            content=shorter
+                        ))
+                    else:
+                        paraphrased.append(clause)
+            else:
+                paraphrased.append(clause)
+        return paraphrased
 
-Given a failed routing query and removed description clauses, identify which
-clauses should be restored to help the routing succeed.
+    def _try_paraphrase_clause(
+        self,
+        clause: SemanticClause
+    ) -> str:
+        """
+        Try to produce a shorter paraphrase of a single clause.
 
-A clause should be restored if:
-1. It contains key distinguishing information about the skill
-2. It addresses the specific topic the user asked about
-3. It helps differentiate this skill from similar ones
+        Args:
+            clause: The semantic clause to paraphrase.
+
+        Returns:
+            Shorter paraphrase string, or original if shortening fails.
+        """
+        if not clause.content or count_tokens(clause.content) <= 5:
+            return clause.content
+
+        system_prompt = """You are an expert at writing concise text.
+
+Your task is to rewrite a single clause to be shorter while preserving ALL
+semantic information. Remove unnecessary words but keep the exact meaning.
 
 IMPORTANT: Respond with a JSON object:
 {
-  "clauses_to_restore": ["clause_id_1", "clause_id_2"],
-  "reasoning": "Why these clauses should be restored"
+  "shorter_version": "the shortened clause"
 }"""
 
-        current_text = " ".join(c.content for c in current_clauses)
-        removed_text = "\n".join([f"[{c.clause_id}] {c.content}" for c in removed_clauses])
+        user_prompt = f"""Original clause:
+"{clause.content}"
 
-        user_prompt = f"""Target Skill: {skill.name}
-Current Description: {current_text}
+Rewrite this clause to be shorter but preserve ALL meaning."""
 
-Failed Query: "{failed_query}"
+        try:
+            response = self.llm_client.client.chat.completions.create(
+                model=self.llm_client.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
 
-Removed Clauses:
-{removed_text}
+            response_text = response.choices[0].message.content
+            result = json.loads(response_text)
+            shorter = result.get("shorter_version", clause.content)
 
-Which removed clauses should be restored to help routing succeed for this query?"""
+            # Only use if actually shorter
+            if shorter and count_tokens(shorter) < count_tokens(clause.content):
+                return shorter
+            return clause.content
 
-        response = self.llm_client.client.chat.completions.create(
-            model=self.llm_client.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.0,
-            response_format={"type": "json_object"}
-        )
-
-        response_text = response.choices[0].message.content
-        result_dict = json.loads(response_text)
-
-        restore_ids = set(result_dict.get("clauses_to_restore", []))
-
-        return [c for c in removed_clauses if c.clause_id in restore_ids]
+        except Exception:
+            return clause.content
 
     def rewrite_and_polish(
         self,
@@ -1129,7 +1335,8 @@ Write a polished, professional skill description."""
         2. Get distractors (4 TF-IDF real + 1 LLM adversarial)
         3. Apply DDMIN (Phase 1) to find 1-minimal subset
         4. Phase 2: Real-world validation with selective restore
-        5. Rewrite and polish the result
+        5. Per-clause paraphrase: try shorter version for each clause (Alg 1 lines 3-5)
+        6. Rewrite and polish the result
 
         Args:
             skill: The skill to compress.
@@ -1162,52 +1369,94 @@ Write a polished, professional skill description."""
         distractors = self.get_distractors(skill, num_real=4, num_adversarial=1)
 
         # Step 3: Define test function for DDMIN (Phase 1)
+        # Per paper: the oracle O(d, Q, C) takes test queries Q = {q1, ..., qk}
+        # and "returns 1 if and only if the routing model consistently selects
+        # the target skill for EVERY query in Q."
+        # We pre-generate k=5 fixed queries to ensure monotonicity and cover
+        # diverse routing scenarios.
+        _ddmin_queries = self._generate_diverse_queries(skill, num_queries=5)
+
         def test_routing_with_clauses(clause_subset: list[SemanticClause]) -> bool:
-            """Test if clause subset maintains routing capability."""
+            """Test if clause subset maintains routing capability for ALL queries."""
             if not clause_subset:
                 return False
 
             # Combine clauses into temporary description
             temp_description = " ".join(c.content for c in clause_subset)
 
-            # Test with oracle
+            # Per paper: oracle O(d, Q, C) returns 1 iff routing succeeds
+            # for EVERY query in Q
             if use_oracle_validation:
-                result = self.test_routing(
-                    compressed_description=temp_description,
-                    target_skill=skill,
-                    distractors=distractors
-                )
-                return result.success
+                for query in _ddmin_queries:
+                    result = self.test_routing(
+                        compressed_description=temp_description,
+                        target_skill=skill,
+                        distractors=distractors,
+                        query=query
+                    )
+                    if not result.success:
+                        return False
+                return True
             else:
                 # Without oracle, always pass (not recommended)
                 return True
 
-        # Step 4: Apply DDMIN (Phase 1)
+        # Step 4: Apply DDMIN (Phase 1) — find 1-minimal subset U*
         minimal_clauses = self.ddmin(clauses, test_routing_with_clauses)
         phase1_passed = len(minimal_clauses) > 0
 
-        # Step 5: Phase 2 - Real-world validation with selective restore
+        # Step 5: Per-clause paraphrase (Algorithm 1 lines 3-5)
+        # Paraphrase BEFORE Phase 2, per paper: each ui in U* is
+        # shortened; keep if O_sim passes. Uses same fixed query set
+        # as DDMIN for oracle consistency.
+        if use_oracle_validation:
+            paraphrased_clauses = self._paraphrase_clauses(
+                clauses=minimal_clauses,
+                target_skill=skill,
+                distractors=distractors,
+                queries=_ddmin_queries
+            )
+        else:
+            paraphrased_clauses = minimal_clauses
+
+        # Step 6: POLISH(JOIN(U*)) — Algorithm 1 line 6
+        d_fast = self.rewrite_and_polish(paraphrased_clauses)
+
+        # Step 7: Phase 2 — validate d_fast (Algorithm 1 lines 7-19)
         phase2_passed = True
-        restored_clauses = []
 
         if enable_phase2 and use_oracle_validation:
-            final_clauses, phase2_passed = self.phase2_validate_with_restore(
-                minimal_clauses=minimal_clauses,
+            final_description, phase2_passed = self.phase2_validate_with_restore(
+                d_fast=d_fast,
+                paraphrased_clauses=paraphrased_clauses,
                 original_clauses=clauses,
                 skill=skill,
                 distractors=distractors,
                 num_queries=5
             )
-            restored_clauses = [c.content for c in final_clauses if c not in minimal_clauses]
-        else:
-            final_clauses = minimal_clauses
 
-        # Step 6: Rewrite and polish
-        compressed_description = self.rewrite_and_polish(final_clauses)
+            # Per Algorithm 1 line 19: fallback to original description if restore fails
+            if not phase2_passed:
+                return CompressionResult(
+                    original_description=original_description,
+                    compressed_description=original_description,
+                    original_token_count=original_tokens,
+                    compressed_token_count=original_tokens,
+                    clauses_removed=0,
+                    compression_ratio=0.0,
+                    phase1_passed=phase1_passed,
+                    phase2_passed=False,
+                    restored_clauses=[]
+                )
+
+            compressed_description = final_description
+        else:
+            compressed_description = d_fast
+
         compressed_tokens = count_tokens(compressed_description)
 
         # Calculate metrics
-        clauses_removed = len(clauses) - len(final_clauses)
+        clauses_removed = len(clauses) - len(paraphrased_clauses)
         compression_ratio = 0.0
         if original_tokens > 0:
             compression_ratio = 1.0 - (compressed_tokens / original_tokens)
@@ -1221,7 +1470,7 @@ Write a polished, professional skill description."""
             compression_ratio=round(compression_ratio, 4),
             phase1_passed=phase1_passed,
             phase2_passed=phase2_passed,
-            restored_clauses=restored_clauses
+            restored_clauses=[]
         )
 
     def compress_skill(

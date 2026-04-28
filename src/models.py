@@ -201,7 +201,7 @@ class RetentionResult(BaseModel):
     Retention calculation result per SkillReducer paper.
 
     Retention = score_C / score_A
-    Passed if retention >= threshold (default 0.86)
+    Passed if retention >= threshold (default 1.0 per paper Algorithm 2 line 24)
     """
 
     score_D: float = Field(

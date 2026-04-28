@@ -31,9 +31,6 @@ Troubleshoot: low save rate → rebuild mapping; low survey completion → make 
 ---
 ## On-Demand Modules
 
-The following modules are available in the `references/` directory and can be loaded when needed:
-- `references/on-demand-examples.md` - Code examples and usage demonstrations
-- `references/on-demand-templates.md` - Ready-to-use templates and boilerplate
-- `references/on-demand-background.md` - Background knowledge and explanations
-
-Use the `read_file` tool to load these when the user asks for examples, templates, or explanations.
+- `references/on-demand-examples.md` — Examples
+- `references/on-demand-templates.md` — Templates
+- `references/on-demand-background.md` — Background

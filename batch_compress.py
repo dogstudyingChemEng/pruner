@@ -212,6 +212,143 @@ def generate_report(results: list[dict], output_dir: str):
     return report_path
 
 
+def save_comparison(result: PipelineResult, original_path: str, compare_dir: str):
+    """
+    Save a side-by-side comparison for a single skill.
+
+    Creates: compare_dir/<skill-name>/
+        original.md   — the original SKILL.md
+        compressed.md — the compressed SKILL.md
+        report.md     — detailed compression report
+    """
+    skill = result.skill
+    skill_dir = os.path.join(compare_dir, skill.name)
+    os.makedirs(skill_dir, exist_ok=True)
+
+    # ---- original.md: copy the original SKILL.md verbatim ----
+    with open(original_path, 'r', encoding='utf-8') as src:
+        original_content = src.read()
+    with open(os.path.join(skill_dir, "original.md"), 'w', encoding='utf-8') as f:
+        f.write(original_content)
+
+    # ---- compressed.md: same format as save_compressed_skill ----
+    frontmatter = f"""---
+name: {skill.name}
+description: |
+  {skill.description.compressed or skill.description.original}
+metadata:
+  version: {skill.metadata.version or '1.0.0'}
+  category: {skill.metadata.category or ''}
+  tags: {json.dumps(skill.metadata.tags)}
+---
+
+"""
+    body_parts = []
+    for block in skill.body.content_blocks:
+        body_parts.append(block.content)
+
+    body_content = "\n\n".join(body_parts)
+
+    on_demand_files = {k: v for k, v in skill.references.files.items()
+                       if k.startswith("on-demand-")}
+    if on_demand_files:
+        body_content += "\n\n---\n## On-Demand Modules\n\n"
+        for ref_name in on_demand_files:
+            display = ref_name.replace(".md", "").replace("on-demand-", "").title()
+            body_content += f"- `references/{ref_name}` — {display}\n"
+
+    with open(os.path.join(skill_dir, "compressed.md"), 'w', encoding='utf-8') as f:
+        f.write(frontmatter + body_content)
+
+    # Save on-demand reference files
+    refs_dir = os.path.join(skill_dir, "references")
+    os.makedirs(refs_dir, exist_ok=True)
+    for ref_name, ref_content in on_demand_files.items():
+        with open(os.path.join(refs_dir, ref_name), 'w', encoding='utf-8') as f:
+            f.write(ref_content)
+
+    # ---- report.md ----
+    lines = []
+    lines.append(f"# Compression Report: {skill.name}")
+    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+
+    # Token summary
+    desc_orig_tok = result.skill.description.original_token_count or 0
+    desc_comp_tok = result.skill.description.compressed_token_count or 0
+    lines.append("## Overall")
+    lines.append("")
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
+    lines.append(f"| Original total tokens | {result.original_tokens:,} |")
+    lines.append(f"| Final total tokens | {result.final_tokens:,} |")
+    lines.append(f"| Overall compression | {result.overall_compression_ratio:.2%} |")
+    lines.append("")
+
+    # Stage 1
+    lines.append("## Stage 1: Description Compression")
+    lines.append("")
+    lines.append(f"**Original** ({desc_orig_tok} tokens):")
+    lines.append(f"> {skill.description.original}")
+    lines.append("")
+    lines.append(f"**Compressed** ({desc_comp_tok} tokens):")
+    lines.append(f"> {skill.description.compressed or '(unchanged)'}")
+    lines.append("")
+    if desc_orig_tok > 0:
+        desc_ratio = 1.0 - desc_comp_tok / desc_orig_tok
+        lines.append(f"Description compression: **{desc_ratio:.2%}**")
+    lines.append("")
+
+    # Stage 2
+    lines.append("## Stage 2: Body Restructuring")
+    lines.append("")
+    if result.compression_metrics:
+        m = result.compression_metrics
+        lines.append("| Type | Tokens | Action |")
+        lines.append("|------|--------|--------|")
+        core_tokens = m.always_loaded_tokens
+        lines.append(f"| Core Rules | {core_tokens:,} | Always loaded (compressed) |")
+        if m.on_demand_examples_tokens:
+            lines.append(f"| Examples | {m.on_demand_examples_tokens:,} | On-demand (references/on-demand-examples.md) |")
+        if m.on_demand_templates_tokens:
+            lines.append(f"| Templates | {m.on_demand_templates_tokens:,} | On-demand (references/on-demand-templates.md) |")
+        if m.on_demand_background_tokens:
+            lines.append(f"| Background | {m.on_demand_background_tokens:,} | On-demand (references/on-demand-background.md) |")
+        if m.discarded_tokens:
+            lines.append(f"| Redundant | {m.discarded_tokens:,} | **Discarded** |")
+        lines.append("")
+
+        lines.append("| Compression Detail | Value |")
+        lines.append("|---------------------|-------|")
+        lines.append(f"| Core compression ratio | {m.core_compression_ratio:.2%} |")
+        lines.append(f"| Examples deduplicated | {m.examples_deduped} |")
+        lines.append(f"| Templates deduplicated | {m.templates_deduped} |")
+        lines.append(f"| Background blocks merged | {m.background_summarized} |")
+        lines.append(f"| Reference blocks deduped | {m.references_deduped} |")
+        lines.append(f"| Reference files discarded | {m.references_discarded} |")
+        lines.append("")
+
+    # Gates
+    lines.append("## Quality Gates")
+    lines.append("")
+    if result.rollback_performed:
+        lines.append(f"Gate 1 (Faithfulness): FAILED — rolled back types: {', '.join(result.rollback_types)}")
+    else:
+        lines.append("Gate 1 (Faithfulness): PASSED")
+    lines.append("")
+
+    if result.errors:
+        lines.append("### Messages")
+        for err in result.errors:
+            lines.append(f"- {err}")
+        lines.append("")
+
+    with open(os.path.join(skill_dir, "report.md"), 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+
+    return skill_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description="Batch compress Claude-Skills")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of skills to process")
@@ -219,6 +356,7 @@ def main():
     parser.add_argument("--skip-errors", action="store_true", help="Continue on errors")
     parser.add_argument("--no-gate1", action="store_true", help="Disable Gate 1 (faithfulness check)")
     parser.add_argument("--start-from", type=int, default=0, help="Start from N-th skill (for resuming)")
+    parser.add_argument("--compare", action="store_true", help="Generate per-skill before/after comparison in compressed_skills/")
     args = parser.parse_args()
 
     # Find all skills
@@ -265,6 +403,10 @@ def main():
         if result:
             # Save compressed skill
             output_path = save_compressed_skill(result, output_dir, skill_path)
+
+            # Generate per-skill comparison if requested
+            if args.compare:
+                save_comparison(result, skill_path, "compressed_skills")
 
             results.append({
                 "success": True,
@@ -318,6 +460,8 @@ def main():
 
     print(f"\nOutput saved to: {output_dir}")
     print(f"Report saved to: {report_path}")
+    if args.compare:
+        print(f"Comparisons saved to: compressed_skills/")
 
 
 if __name__ == "__main__":
