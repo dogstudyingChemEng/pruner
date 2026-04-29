@@ -1,535 +1,201 @@
 # SkillReducer
 
-## 项目简介
+复现论文 [*SkillReducer: Optimizing LLM Agent Skills for Token Efficiency*](https://arxiv.org/abs/2603.29919) (Gao et al., 2026) 的两阶段 Skill Debloating 框架，对 LLM Agent 技能进行压缩以降低 Token 成本。
 
-SkillReducer 通过两阶段流水线对 LLM Agent 技能进行压缩优化：
+## 核心思路
 
-**阶段一：路由层优化 (Routing Layer Optimization)**
-- 语义分割：将描述拆分为语义子句
-- 模拟 Oracle (O_sim)：生成对抗技能测试路由等价性
-- DDMIN 算法：Delta Debugging 找到 1-minimal 子集
-- 重写润色：将最小子句集合并为流畅描述
+技能由描述（路由层）和正文（指令层）组成。论文通过实证研究发现 55,315 个公开技能存在系统性冗余：26.4% 缺乏路由描述，60%+ 的正文内容非可操作。SkillReducer 通过两个阶段解决：
 
-**阶段二：主体重构 (Body Restructuring via Progressive Disclosure)**
-- 分类驱动的五类内容分类：
-  - `core_rule`：核心规则（可操作指令）— 始终加载
-  - `background`：背景说明（解释性内容）— 按需加载模块
-  - `example`：示例（代码片段）— 按需加载模块
-  - `template`：模板（样板文本）— 按需加载模块
-  - `redundant`：冗余内容 — 丢弃
-- 各类型压缩处理：核心规则合并、示例去重、模板去重、背景总结
-- 跨文件去重：主体与引用文件之间的去重
-- 质量门控：忠实性检查 + 任务评估反馈循环
+| 阶段 | 目标 | 方法 | 论文效果 |
+|------|------|------|----------|
+| Stage 1 | 路由描述压缩 | DDMIN delta debugging + 对抗 oracle + 真实 CLI 验证 | 48% 压缩 |
+| Stage 2 | 正文重构 | 五类分类 + 渐进式披露 (progressive disclosure) | 39% 压缩 |
+| Quality Gates | 质量保证 | 忠实性验证 + 任务评估反馈循环 | 86% 通过率 |
 
-**质量门控 (Quality Gates)**
-- Gate 1：忠实性验证 — 检查核心操作概念是否保留
-- Gate 2：反馈循环 — 基于任务失败提升相关块为核心规则
-- 自动回滚：当 Gate 1 失败时回滚到未压缩版本
+## 快速开始
 
-### 关键指标
+```bash
+# 安装依赖
+pip install -r requirement.txt
 
-| 指标 | 说明 | 预期效果 |
-|------|------|----------|
-| 压缩率 | Token 减少百分比 | 描述 ~48%，主体 ~39% |
-| 保留率 | score_C / score_A | 86% 通过率 |
-| 跨模型迁移 | 不同模型间的保留率 | 0.965 均值 |
+# 配置 API (支持 OpenAI / DeepSeek / Qwen)
+cp .env.example .env
+# 编辑 .env 填入 OPENAI_API_KEY 和 OPENAI_BASE_URL
+
+# 压缩全部 245 个技能
+python batch_compress.py --skip-errors
+
+# 先测试 3 个
+python batch_compress.py --limit 3
+
+# 生成每个技能的前后对比
+python batch_compress.py --limit 5 --compare
+
+# 运行全部 121 个测试
+pytest tests/ -v
+```
 
 ## 项目结构
 
 ```
 skillpruner/
-├── src/                        # 核心源代码
-│   ├── __init__.py
-│   ├── models.py              # 数据模型 (Skill, ContentBlock, ContentType 等)
-│   ├── parser.py              # 技能文件解析 (SKILL.md, YAML frontmatter)
-│   ├── chunker.py             # Markdown 语义分块
-│   ├── llm_client.py          # LLM API 客户端 (支持 OpenAI/DeepSeek/Qwen)
-│   ├── stage1_router.py       # 阶段一路由优化器 (NEW)
-│   ├── optimizer.py           # 阶段二主体优化器
-│   └── quality_gates.py       # 质量门控实现 (NEW)
+├── src/
+│   ├── models.py              # Pydantic 数据模型
+│   ├── parser.py              # SKILL.md 解析 (YAML frontmatter)
+│   ├── chunker.py             # Markdown 语义分块 + tiktoken
+│   ├── llm_client.py          # OpenAI 兼容客户端 (tenacity 重试)
+│   ├── config.py              # SkillReducerConfig (feature toggles)
+│   ├── stage1_router.py       # Stage 1: DDMIN 路由层压缩
+│   ├── optimizer.py           # Stage 2: 分类 + 渐进式披露
+│   ├── quality_gates.py       # Gate 1 (忠实性) + Gate 2 (反馈循环)
+│   ├── hybrid_evaluator.py    # pytest + LLM judge 混合评分
+│   └── cli_validator.py       # Claude Code CLI 真实触发验证
 │
-├── tests/                      # 单元测试
-│   ├── test_parser.py         # 解析器测试
-│   ├── test_chunker.py        # 分块器测试
-│   ├── test_optimizer.py      # 阶段二优化器测试
-│   ├── test_stage1.py         # 阶段一路由器测试 (NEW)
-│   └── test_quality_gates.py  # 质量门控测试 (NEW)
-│
-├── data/                       # 输入/输出数据目录
-│
-├── Claude-Skills/              # 245 个生产级技能包 (评估测试数据)
-│   ├── engineering/           # 76 个工程技能
-│   ├── marketing/             # 38 个营销技能
-│   ├── c-level-advisor/       # 26 个 C 级顾问技能
-│   ├── hr-operations/         # HR 运营技能
-│   ├── finance/               # 财务技能
-│   ├── legal/                 # 法律技能
-│   └── ...                    # 其他领域
-│
-├── demo_compression.py         # 压缩演示脚本
-├── demo_detailed.py            # 详细过程演示脚本
-├── generate_report.py          # 英文报告生成脚本
-├── generate_report_zh.py       # 中文报告生成脚本
-│
-├── requirement.txt             # Python 依赖
-├── .env.example               # 环境变量示例
-├── CLAUDE.md                  # Claude Code 开发指南
-└── README.md                  # 本文件
+├── batch_compress.py           # 批量压缩脚本 (支持 --compare)
+├── tests/                      # 121 个单元测试
+├── Claude-Skills/              # 245 个技能包 (测试数据)
+├── requirement.txt
+└── .env.example
 ```
 
-## 安装
+## 压缩流水线详解
 
-### 1. 克隆项目
+### Algorithm 1: Stage 1 — 路由层优化
 
-```bash
-git clone https://github.com/your-repo/skillpruner.git
-cd skillpruner
+```
+SEGMENT(s.d) → DDMIN(U, O_sim, Q) → 逐句 Paraphrase → POLISH → d_fast
+                                                                    ↓
+                                          original ← NO ← REALTRIGGER(d_fast, Qval)?
+                                                                    ↓ YES
+                                                               return d_fast
 ```
 
-### 2. 创建虚拟环境（推荐）
+1. **语义分割** — LLM 将描述拆分为独立语义子句
+2. **DDMIN** — 完整 Zeller & Hildebrandt (2002) 算法：complement testing + subset testing，找到 1-minimal 子集
+3. **Oracle O_sim** — 5 个固定 query，4 个 TF-IDF 真实 distractor + 1 个 LLM 生成的对抗 skill，候选顺序随机化
+4. **逐句 Paraphrase** — 尝试缩短每个保留子句，仅当 O_sim 仍通过时保留
+5. **POLISH** — LLM 将最小子句集合并为流畅描述
+6. **Phase 2 真实验证** — 通过 Claude Code CLI（或模拟 oracle）验证，最多 3 步贪心选择性恢复
+7. **Fallback** — 恢复失败则退回原始描述
 
-```bash
-python -m venv venv
-source venv/bin/activate  # Linux/macOS
-# 或
-venv\Scripts\activate     # Windows
+**描述生成** (缺失或 ≤40 token 的描述)：从正文提取 3 个路由信号（primary_capability, trigger_condition, unique_identifiers），各 20-40 token，经 O_sim 验证后接受。
+
+### Algorithm 2: Stage 2 — 正文重构
+
+```
+CLASSIFY(s.b) → 五类分拣 → 类型特定压缩 → 交叉文件去重 → 注释路由元数据
+                    ↓
+    core_rule         background/example/template         redundant
+   (始终加载)           (按需加载, read_file)              (丢弃)
 ```
 
-### 3. 安装依赖
+1. **分类** — LLM (温度 0) 将正文分为五类，失败 3 次后退回 `core_rule`
+2. **交叉验证** — 最多 2 轮，结合邻居标签重新评估每个 block
+3. **COMPRESSCORE** — 核心规则合并为简洁要点（压缩后必须更短）
+4. **DEDUP** — 示例/模板按概念分组，每组保留最优 1 个，去除注释和样板
+5. **SUMMARIZE** — 背景合并为单段，保留所有数字、阈值、API 端点
+6. **REMOVEOVERLAP + COMPRESS** — 引用文件与正文去重后，压缩剩余内容，<30 token 的丢弃
+7. **GENWHEN / GENTOPICS** — 为每个引用生成 when 触发条件 + 3-5 个主题关键词
 
-```bash
-pip install -r requirement.txt
-```
+### Quality Gates
 
-### 4. 配置环境变量
+- **Gate 1: 忠实性验证** — Eq. 3: `C_τ(s.b) ⊆ C_τ(b*) ∪ C_τ(R*)`，按内容类型细粒度回滚
+- **Gate 2: 任务评估反馈循环** — 生成 5 个评估任务，失败则提升相关 block 至 core_rule（原始形式，不压缩），最多 2 轮
+- **三条件评估 (D/A/C)** — 混合评分：pytest 52.3% + LLM judge 47.7%，Cohen's κ 验证
 
-创建 `.env` 文件：
-
-```bash
-cp .env.example .env
-```
-
-编辑 `.env` 文件，填入你的 API 配置：
-
-```env
-# OpenAI API (默认)
-OPENAI_API_KEY=sk-your-api-key
-OPENAI_BASE_URL=https://api.openai.com/v1
-
-# 或使用 DeepSeek
-OPENAI_API_KEY=sk-your-deepseek-key
-OPENAI_BASE_URL=https://api.deepseek.com/v1
-
-# 或使用 Qwen
-OPENAI_API_KEY=sk-your-qwen-key
-OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-```
-
-## 快速开始
-
-### 运行单元测试
-
-```bash
-# 运行所有测试 (61 个测试)
-pytest tests/ -v
-
-# 运行单个测试文件
-pytest tests/test_parser.py -v
-pytest tests/test_chunker.py -v
-pytest tests/test_optimizer.py -v
-pytest tests/test_stage1.py -v
-pytest tests/test_quality_gates.py -v
-
-# 带覆盖率报告
-pytest tests/ --cov=src
-```
-
-### 使用完整压缩流水线
+## 编程使用
 
 ```python
 from src.parser import parse_skill_file
 from src.llm_client import SkillLLMClient
 from src.quality_gates import run_pipeline
 
-# 1. 解析技能文件
 skill = parse_skill_file("Claude-Skills/marketing/marketing-strategy-pmm/SKILL.md")
+client = SkillLLMClient(api_key="sk-xxx", base_url="https://api.deepseek.com/v1", model="deepseek-chat")
 
-# 2. 初始化 LLM 客户端
-client = SkillLLMClient(
-    api_key="your-api-key",
-    base_url="https://api.deepseek.com/v1",
-    model="deepseek-v4-flash"
-)
+result = run_pipeline(skill, client, enable_gate1=True, enable_gate2=False)
 
-# 3. 运行完整压缩流水线
-result = run_pipeline(
-    skill,
-    llm_client=client,
-    enable_gate1=True,    # 启用忠实性验证
-    enable_gate2=False    # 禁用反馈循环
-)
-
-# 4. 查看结果
-print(f"阶段一压缩: {result.stage1_compressed}")
-print(f"阶段二压缩: {result.stage2_compressed}")
-print(f"忠实性通过: {result.faithfulness_passed}")
-print(f"回滚执行: {result.rollback_performed}")
-print(f"原始 Token: {result.original_tokens}")
-print(f"最终 Token: {result.final_tokens}")
-print(f"总压缩率: {result.overall_compression_ratio:.2%}")
-
-# 5. 获取压缩后的技能
-compressed_skill = result.skill
+print(f"压缩率: {result.overall_compression_ratio:.1%}")
+print(f"Gate 1: {'PASS' if result.faithfulness_passed else 'FAIL'}")
+print(f"原始: {result.original_tokens:,} → 最终: {result.final_tokens:,} tokens")
 ```
 
-### 分阶段使用
+### 配置预设
 
 ```python
-from src.parser import parse_skill_file
-from src.llm_client import SkillLLMClient
-from src.stage1_router import Stage1Optimizer
-from src.optimizer import Stage2Optimizer
-from src.quality_gates import QualityGates
+from src.config import get_paper_config, get_fast_config
 
-# 初始化
-client = SkillLLMClient(api_key="your-key", model="gpt-4o-mini")
-skill = parse_skill_file("path/to/SKILL.md")
+# 论文完整配置 (真实 CLI + 三条件评估 + 混合评分)
+config = get_paper_config()
 
-# 阶段一：描述压缩
-stage1 = Stage1Optimizer(client)
-skill = stage1.compress_skill(skill, use_oracle_validation=True)
-print(f"描述压缩: {skill.description.original} -> {skill.description.compressed}")
-
-# 阶段二：主体重构
-stage2 = Stage2Optimizer(client)
-blocks, refs, metrics = stage2.optimize_skill(
-    skill,
-    compress_core=True,
-    dedup_examples=True,
-    dedup_templates=True,
-    summarize_background=True,
-    dedup_references=True
-)
-print(f"核心压缩率: {metrics.core_compression_ratio:.2%}")
-
-# Gate 1：忠实性验证
-gates = QualityGates(client)
-faith_result = gates.run_faithfulness_gate(skill, blocks)
-if faith_result.should_rollback:
-    print("忠实性验证失败，需要回滚")
-    blocks = stage2.classify_skill_body(skill)  # 回滚到原始分类
+# 快速批量处理 (无 CLI, 无三条件, 无混合评分)
+config = get_fast_config()
 ```
 
-### 运行演示脚本
+## 批量压缩
 
 ```bash
-# 基本压缩演示
-python demo_compression.py
-
-# 详细过程演示
-python demo_detailed.py
-
-# 生成英文报告
-python generate_report.py
-
-# 生成中文报告
-python generate_report_zh.py
+python batch_compress.py [--limit N] [--start-from N] [--skip-errors] [--no-gate1] [--compare]
 ```
 
-## 核心模块说明
+| 参数 | 说明 |
+|------|------|
+| `--limit N` | 仅处理前 N 个 skill |
+| `--start-from N` | 从第 N 个开始 (断点续跑) |
+| `--skip-errors` | 遇到错误继续 |
+| `--no-gate1` | 跳过忠实性检查 (加速) |
+| `--compare` | 生成 `compressed_skills/<name>/` 对比目录 |
 
-### models.py - 数据模型
-
-定义核心数据结构：
-
-```python
-from src.models import Skill, ContentBlock, ContentType, Description, Body, References
-
-# 内容类型枚举
-class ContentType(str, Enum):
-    CORE_RULE = "core_rule"      # 核心规则
-    BACKGROUND = "background"    # 背景说明
-    EXAMPLE = "example"          # 示例
-    TEMPLATE = "template"        # 模板
-    REDUNDANT = "redundant"      # 冗余内容
-
-# 内容块 (支持 use_enum_values 配置)
-class ContentBlock(BaseModel):
-    chunk_id: str           # 块 ID
-    content: str            # 内容文本
-    content_type: ContentType  # 分类类型 (存储为字符串)
-    token_count: int        # Token 数量
-
-# 完整技能
-class Skill(BaseModel):
-    name: str               # 技能名称
-    description: Description  # 技能描述 (含压缩版本)
-    body: Body              # 技能主体
-    references: References  # 引用文件
-    metadata: SkillMetadata # 元数据
-```
-
-### stage1_router.py - 阶段一路由优化
-
-描述压缩实现：
-
-```python
-from src.stage1_router import Stage1Optimizer, CompressionResult
-
-optimizer = Stage1Optimizer(llm_client=client)
-
-# 语义分割
-clauses = optimizer.segment_description(description)
-
-# 生成对抗技能
-adversarial = optimizer.generate_adversarial_skill(skill)
-
-# 路由测试
-result = optimizer.test_routing(
-    compressed_description="压缩后的描述",
-    target_skill=skill,
-    adversarial_skills=adversarial
-)
-
-# DDMIN 算法
-minimal_clauses = optimizer.ddmin(clauses, test_function)
-
-# 重写润色
-polished = optimizer.rewrite_and_polish(minimal_clauses)
-
-# 完整压缩
-result = optimizer.compress_description(skill, use_oracle_validation=True)
-```
-
-### optimizer.py - 阶段二主体优化
-
-主体重构实现：
-
-```python
-from src.optimizer import Stage2Optimizer, CompressionMetrics
-
-optimizer = Stage2Optimizer(llm_client=client)
-
-# 分类技能主体
-blocks = optimizer.classify_skill_body(skill)
-
-# 各类型压缩处理
-core_blocks = optimizer.compress_core_rules(core_blocks)
-example_blocks, removed = optimizer.dedup_examples(example_blocks)
-template_blocks, removed = optimizer.dedup_templates(template_blocks)
-background_blocks, merged = optimizer.summarize_background(background_blocks)
-refs, deduped, discarded = optimizer.dedup_references(body_blocks, references)
-
-# 完整优化流水线
-blocks, refs, metrics = optimizer.optimize_skill(skill)
-```
-
-### quality_gates.py - 质量门控
-
-质量保证机制：
-
-```python
-from src.quality_gates import QualityGates, CompressionPipeline, run_pipeline
-
-gates = QualityGates(llm_client=client)
-
-# Gate 1: 忠实性验证
-result = gates.verify_faithfulness(
-    original_body=skill.body.original,
-    compressed_core_rules="压缩后的核心规则"
-)
-print(f"通过: {result.passed}")
-print(f"缺失概念: {result.missing_concepts}")
-
-# Gate 2: 反馈循环
-feedback = gates.feedback_loop(
-    blocks=compressed_blocks,
-    failed_criteria=["任务失败的原因"]
-)
-print(f"提升块数: {feedback.promotion_count}")
-
-# 使用完整流水线
-pipeline = CompressionPipeline(
-    llm_client=client,
-    enable_gate1=True,
-    enable_gate2=True
-)
-result = pipeline.run_pipeline(skill)
-```
-
-### parser.py - 技能解析
-
-解析 SKILL.md 文件：
-
-```python
-from src.parser import parse_skill_file, parse_skill_directory
-
-# 解析单个文件
-skill = parse_skill_file("path/to/SKILL.md")
-
-# 解析目录
-skill = parse_skill_directory("path/to/skill-dir/")
-```
-
-### chunker.py - 语义分块
-
-将 Markdown 主体拆分为语义块：
-
-```python
-from src.chunker import chunk_markdown_body, count_tokens
-
-# 分块
-blocks = chunk_markdown_body(skill.body.original)
-
-# 统计 Token
-token_count = count_tokens(text)
-```
-
-### llm_client.py - LLM 客户端
-
-支持 OpenAI 兼容 API：
-
-```python
-from src.llm_client import SkillLLMClient
-
-# 初始化
-client = SkillLLMClient(
-    api_key="your-key",
-    base_url="https://api.deepseek.com/v1",  # 可选
-    model="deepseek-v4-flash"
-)
-
-# 测试连接
-if client.test_connection():
-    print("连接成功")
-
-# 分类内容块
-result = client.classify_content_blocks(
-    content_chunks=[
-        {"chunk_id": "1", "content": "这是核心规则内容..."},
-        {"chunk_id": "2", "content": "这是背景说明..."}
-    ],
-    skill_context="技能名称: 数据分析\n描述: 帮助用户进行数据分析"
-)
-```
-
-## 技能包结构
-
-每个技能遵循以下结构：
+### 对比输出 (`--compare`)
 
 ```
-skill-name/
-├── SKILL.md              # 主文档 (YAML frontmatter + Markdown 主体)
-├── scripts/              # Python CLI 工具 (仅使用标准库)
-├── references/           # 专业知识库
-└── assets/               # 用户模板
+compressed_skills/
+└── marketing-strategy-pmm/
+    ├── original.md           # 原始 SKILL.md
+    ├── compressed.md         # 压缩后 SKILL.md (仅 core rules)
+    ├── report.md             # 详细压缩报告
+    └── references/           # 按需加载模块
+        ├── on-demand-examples.md
+        ├── on-demand-templates.md
+        └── on-demand-background.md
 ```
 
-SKILL.md 文件示例：
+## API 提供商
 
-```markdown
----
-name: marketing-strategy-pmm
-description: |
-  Product Marketing Manager skill for developing comprehensive go-to-market
-  strategies, product positioning, and competitive analysis.
-metadata:
-  version: 1.0.0
-  category: marketing
-  tags:
-    - product-marketing
-    - go-to-market
-    - positioning
----
+支持所有 OpenAI 兼容 API，`batch_compress.py` 自动检测模型：
 
-# Marketing Strategy Skill
+| 提供商 | Base URL | 自动模型 |
+|--------|----------|----------|
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-v4-flash` |
+| Qwen | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| 其他兼容 | 自定义 | 设置 `LLM_MODEL` 环境变量 |
 
-## Core Principles
+## 测试
 
-1. Always start with customer research
-2. Define clear target segments
-...
-
-## Background
-
-Product marketing is the process of bringing a product to market...
+```bash
+pytest tests/ -v                    # 全部 121 个测试
+pytest tests/test_stage1.py -v      # Stage 1 (DDMIN, oracle, 分割)
+pytest tests/test_optimizer.py -v   # Stage 2 (分类, 压缩, 去重)
+pytest tests/test_quality_gates.py -v  # Gates (忠实性, 反馈循环, 流水线)
+pytest tests/ --cov=src             # 带覆盖率
 ```
 
-## 压缩效果示例
-
-以 `marketing-strategy-pmm` 技能为例：
-
-| 指标 | 压缩前 | 压缩后 | 变化 |
-|------|--------|--------|------|
-| 描述 Token | 45 | 23 | 48.9% |
-| 主体 Token | 1,245 | 901 | 27.8% |
-| 核心规则 Token | - | 312 | 始终加载 |
-| 按需加载 Token | - | 589 | 可延迟 |
-| 丢弃 Token | - | 344 | 已移除 |
-| **总压缩率** | - | - | **35.5%** |
-
-## API 兼容性
-
-支持所有 OpenAI 兼容的 API：
-
-| 提供商 | base_url | model |
-|--------|----------|-------|
-| OpenAI | https://api.openai.com/v1 | gpt-4o-mini, gpt-4o |
-| DeepSeek | https://api.deepseek.com/v1 | deepseek-v4-flash |
-| Qwen | https://dashscope.aliyuncs.com/compatible-mode/v1 | qwen-turbo, qwen-plus |
-| 本地模型 | http://localhost:8000/v1 | 根据部署配置 |
-
-## 依赖说明
+## 依赖
 
 ```
-pydantic>=2.0        # 数据验证和模型
-pyyaml>=6.0          # YAML 解析
-openai>=1.0          # OpenAI API 客户端
-tiktoken>=0.5        # Token 计数
-markdown-it-py>=3.0  # Markdown 解析
-tenacity>=8.0        # 重试机制
-python-dotenv>=1.0   # 环境变量管理
-pytest>=7.0          # 测试框架
-pytest-cov>=4.0      # 测试覆盖率
+pydantic>=2.0        openai>=1.0          tiktoken>=0.5
+pyyaml>=6.0          markdown-it-py>=3.0   tenacity>=8.0
+python-dotenv>=1.0   pytest>=7.0
 ```
 
-## 开发指南
+## 论文引用
 
-### 添加新的内容类型
-
-1. 在 `models.py` 中扩展 `ContentType` 枚举
-2. 更新 `llm_client.py` 中的分类提示词
-3. 更新 `optimizer.py` 中的压缩处理逻辑
-4. 更新 `quality_gates.py` 中的反馈循环逻辑
-
-### 扩展 LLM 提供商
-
-客户端已支持所有 OpenAI 兼容 API，只需配置正确的 `base_url` 和 `model` 参数。
-
-### 自定义分块策略
-
-修改 `chunker.py` 中的 `_group_tokens_into_chunks` 函数，调整分块粒度。
-
-### 自定义质量门控阈值
-
-```python
-# 修改忠实性阈值 (默认 1.0 要求所有概念保留)
-gates = QualityGates(client, faithfulness_threshold=0.8)
+```bibtex
+@article{gao2026skillreducer,
+  title={SkillReducer: Optimizing LLM Agent Skills for Token Efficiency},
+  author={Gao, Yudong and Li, Zongjie and Yuan, Yuanyuan and Ji, Zimo and Ma, Pingchuan and Wang, Shuai},
+  journal={arXiv preprint arXiv:2603.29919},
+  year={2026}
+}
 ```
-
-## 测试覆盖
-
-当前测试覆盖率：
-
-| 模块 | 测试数 | 覆盖内容 |
-|------|--------|----------|
-| test_parser.py | 7 | 文件解析、元数据、引用文件 |
-| test_chunker.py | 10 | 分块、Token 计数、边界情况 |
-| test_optimizer.py | 19 | 分类、压缩方法、完整流水线 |
-| test_stage1.py | 11 | 分割、Oracle、DDMIN、重写 |
-| test_quality_gates.py | 13 | 忠实性、反馈循环、完整流水线 |
-| **总计** | **61** | 全模块覆盖 |
-
-## 许可证
-
-MIT License
